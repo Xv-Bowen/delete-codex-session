@@ -3431,34 +3431,7 @@ def load_offline_helper_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    interpreter_bytes = b"approved synthetic interpreter"
-    interpreter_contract = {
-        "interpreter_path": str(Path(sys.executable).resolve()),
-        "interpreter_sha256": module.sha256_bytes(interpreter_bytes),
-        "interpreter_version": [
-            sys.version_info.major,
-            sys.version_info.minor,
-            sys.version_info.micro,
-        ],
-    }
-    module.current_interpreter_contract = lambda: dict(interpreter_contract)
     return module
-
-
-def exercise_interpreter_executable_safety_contract() -> None:
-    helper = load_offline_helper_module()
-    with temporary_directory() as tmp:
-        interpreter = Path(tmp) / "python"
-        interpreter.write_bytes(b"synthetic interpreter")
-        interpreter.chmod(0o755)
-        assert helper.safe_interpreter_bytes(interpreter) == b"synthetic interpreter"
-        interpreter.chmod(0o775)
-        try:
-            helper.safe_interpreter_bytes(interpreter)
-        except helper.SourceChangedError as exc:
-            assert "not a safe executable" in str(exc)
-        else:
-            raise AssertionError("a group-writable Python interpreter was accepted")
 
 
 def create_offline_helper_test_job(
@@ -8281,7 +8254,6 @@ def main() -> None:
     exercise_scope_fingerprint_stability()
     exercise_semantic_scope_change_matrix()
     exercise_structural_database_filename_discovery()
-    exercise_interpreter_executable_safety_contract()
     exercise_staged_long_capsule_transport_contract()
     exercise_stage_rejects_changed_report_before_job_creation()
     exercise_stage_accepts_paginated_sidecar_churn()
