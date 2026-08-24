@@ -33,4 +33,3 @@ jobs:
 
       - name: Run regression suite
         run: python tests/smoke_test.py
-
