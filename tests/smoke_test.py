@@ -3598,6 +3598,9 @@ def stage_synthetic_handoff(
 ) -> tuple[Path, dict[str, object], str, str]:
     codex_home = root / ".codex"
     codex_home.mkdir(mode=0o700)
+    helper.safe_interpreter_bytes = (
+        lambda _path: b"approved synthetic interpreter"
+    )
     core = fake_staged_core(token, historical=historical)
     helper.load_verified_core_module = lambda _path, _source: core
     helper.preflight_approved_request = lambda _request: {
