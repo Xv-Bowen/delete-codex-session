@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+.session-deletion-jobs/

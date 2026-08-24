@@ -1,0 +1,6 @@
+interface:
+  display_name: "Delete Codex Session"
+  short_description: "Delete safe session data and preserve warned items"
+  default_prompt: "Use $delete-codex-session to report the exact scope, preserve warned items, obtain one combined scope-and-deletion approval, and use one native-AppleScript Ghostty window for offline work."
+policy:
+  allow_implicit_invocation: true
