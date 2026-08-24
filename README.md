@@ -1,6 +1,6 @@
 # Delete Codex Session
 
-[![Test](https://github.com/Xv-Bowen/Delete-Codex-Session/actions/workflows/test.yml/badge.svg)](https://github.com/Xv-Bowen/Delete-Codex-Session/actions/workflows/test.yml)
+[![Test](https://github.com/Xv-Bowen/delete-codex-session/actions/workflows/test.yml/badge.svg)](https://github.com/Xv-Bowen/delete-codex-session/actions/workflows/test.yml)
 
 A safety-focused Codex skill for reporting and permanently deleting one or more Codex Desktop or CLI sessions. It covers recursive subagents, related files, database rows, UI state, and optional historical residuals while preserving ambiguous or protected objects.
 
