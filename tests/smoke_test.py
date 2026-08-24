@@ -7919,13 +7919,26 @@ def exercise_scope_fingerprint_stability() -> None:
         codex_home.mkdir()
         init_state(codex_home / "state_5.sqlite", codex_home)
         init_logs(codex_home / "logs_2.sqlite")
-        plan = module.make_plan(
-            codex_home,
-            [TARGET_CLOSED_CHILD],
-            False,
-            True,
-            True,
-        )
+        original_time = module.time.time
+        try:
+            module.time.time = lambda: 1_900_000_000.0
+            plan = module.make_plan(
+                codex_home,
+                [TARGET_CLOSED_CHILD],
+                False,
+                True,
+                True,
+            )
+            module.time.time = lambda: 1_900_086_400.0
+            later_report = module.make_plan(
+                codex_home,
+                [TARGET_CLOSED_CHILD],
+                False,
+                True,
+                True,
+            )
+        finally:
+            module.time.time = original_time
         target_before = module.approval_scope_fingerprint(
             plan,
             False,
@@ -7937,6 +7950,34 @@ def exercise_scope_fingerprint_stability() -> None:
             True,
             False,
             False,
+        )
+        assert (
+            module.approval_scope_fingerprint(
+                later_report,
+                False,
+                False,
+                False,
+            )
+            == target_before
+        )
+        assert (
+            module.approval_scope_fingerprint(
+                later_report,
+                True,
+                False,
+                False,
+            )
+            == historical_before
+        )
+        plan.preflight["report_generated_at_epoch_ms"] = 1_900_000_000_000
+        assert (
+            module.approval_scope_fingerprint(plan, False, False, False)
+            == target_before
+        )
+        plan.preflight["report_generated_at_epoch_ms"] = 1_900_086_400_000
+        assert (
+            module.approval_scope_fingerprint(plan, False, False, False)
+            == target_before
         )
         plan.preflight["desktop_owner_processes"] = [
             {"pid": 99999, "executable": "/Applications/Codex.app/test"}
