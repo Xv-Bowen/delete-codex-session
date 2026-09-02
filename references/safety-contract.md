@@ -48,7 +48,7 @@ Every skill invocation begins with the helper's bounded read-only `audit-jobs` i
 Classifications narrow the permitted action:
 
 - A verified-success receipt may undergo strict `cleanup-completed` metadata finalization; this cannot rerun deletion.
-- The only partial receipt eligible for automatic recovery is the engine-recognized empty-historical-snapshot anomaly. `recover-empty-historical` must recheck the exact Codex-home boundary, inactive locks, receipt identity, original zero-object historical scope, successful target verification, healthy integrity checks, unchanged selected state/log databases, and fresh target absence before it may mark success and invoke strict cleanup.
+- An engine-recognized empty-historical-snapshot anomaly may be finalized without new deletion. Separately, a non-empty `recoverable_skipped_historical_component` may receive a fresh approved historical-only successor only when the historical component made no write, target deletion and offline verification succeeded, all target evidence remains absent, integrity is healthy, targets/options match, and the fresh plan has zero target work. No other partially mutated receipt may be retried or superseded.
 - Later historical residuals are outside an originally empty approved snapshot. Preserve and report them for a new scope decision.
 - A terminal failure may enter a later successful cleanup lineage only through its exact validated job directory.
 - Active, pending, genuinely partial, malformed, cross-home, unsupported, linked, or unexpected-entry jobs remain preserved.
@@ -87,31 +87,31 @@ The macOS Automation/TCC prompt that may appear when controlling Ghostty is sepa
 
 ## Runtime schema compatibility
 
-Judge evolving SQLite schemas by the structures used for the requested operation, not by a whole-database table-name or version whitelist. A higher `user_version`, unrelated table, additive non-reference field, index, or read-only view is compatible when required anchor tables, locator columns, primary keys, reference formats, integrity checks, and mutation-affecting triggers remain valid.
+Judge evolving SQLite schemas by the structures and actual effects used for the requested operation, not by a whole-database whitelist. A higher `user_version`, unknown table, additive field, index, view, trigger, or foreign key is evidence to inspect; none is unsafe merely because it exists.
 
 Discover state, logs, and paginated-history database families structurally. Paginated history is compatible only when `thread_history_projection_state`, `thread_turns`, and `thread_items` retain their required locator columns and primary keys; nested UUIDs in item payloads are evidence only and never row-deletion authority. Also inspect safe `.db` and `.sqlite` files in the managed SQLite directory for Desktop-catalog and auxiliary-table role anchors instead of requiring product filenames. Select a sole safe role member even when its name or suffix is new; when several files expose the same role anchor, preserve that database family as ambiguous. Freeze the selected path and stable main-file identity in the semantic scope, and freeze the full discovery inventory in the execution snapshot and verification. Never use `-wal` or `-shm` lifecycle metadata as database identity. A later selected path or main-file identity change cannot be followed automatically.
 
-Inspect every column of an unknown table and every newly discovered thread/session/conversation-shaped reference column in a known table for candidate UUIDs. The assessment may only narrow deletion:
+Inspect every column of an unknown table and every newly discovered thread/session/conversation-shaped reference column in a known table for candidate UUIDs. When a target reference or mutation dependency is present, clone the database in memory, run the exact built-in mutation, and compare every row before and after. Freeze the resulting row-key/row-content effect digest in the execution contract.
 
 - Unknown storage with no candidate UUID is a compatible extension and remains untouched.
-- A candidate UUID found in unknown storage is added to the protected set. Unknown rows are never deleted.
-- If a requested target is referenced by an extension, preserve only the affected state, logs, Desktop, or individual auxiliary database and continue independent safe components.
-- If bounded extension inspection cannot complete, protect all affected candidates. Do not infer absence from an incomplete scan.
-- A modified anchor primary key, missing required column, mutation-affecting trigger, failed integrity check, unreadable storage boundary, or incompatible canonical reference remains a gate or component-level safety warning.
+- A target reference in unknown storage is compatible when the deterministic built-in mutation reaches it through an existing trigger/foreign-key dependency, removes it, changes no row lacking target ownership, introduces no new reference, and leaves integrity healthy. The model does not invent SQL for it.
+- A trigger or foreign key is compatible when shadow execution proves its complete effect is target-contained. SQL text is evidence; the shadow effect, not naming intuition, decides.
+- If a target reference remains, a non-target row changes, a new row appears, integrity fails, or bounded inspection cannot complete, preserve only the affected dependency and continue independent work.
+- A modified mutation anchor, unreadable boundary, ambiguous database identity, or incompatible canonical reference remains a gate or component-level warning because no deterministic effect can be established.
 
 For historical classification, compute liveness as the union of canonical state-thread IDs, runtime-protected extension IDs, and recent canonical IDs that exist only in logs. Only a candidate absent from that union and every other authoritative evidence source may enter the historical residual scope. The recent log-only exception is bounded: any non-log evidence disables it, and old log-only IDs remain ordinary residuals.
 
-The active model may explain the assessment, recognize evidence-backed additive compatibility, and recommend an applicable scope. This authority is deliberately independent of a particular model name or release. It must not invent SQL for unknown objects, manually override protected IDs, or treat semantic guesses as proof. Truly opaque or structurally incompatible future storage can still require preservation; compatibility is evidence-based, not a promise to mutate every future format.
+The active model interprets the complete ownership and effect evidence, recognizes target-contained evolution, and recommends scope. Keep its instructions short enough to permit judgment. It must not invent mutation SQL, add selectors, or waive failed integrity/identity evidence. Opaque or structurally redefined storage can still require preservation.
 
 ## Component rules
 
 - Resolve recursive subagents only from an audited state schema. If unavailable, warn that recursive expansion was skipped and operate only on independently proven exact IDs.
 - Include exact matching logs by default. Skip an unsafe logs store without suppressing other components.
-- For paginated targets, freeze every owned projection/turn/item row by primary key and row hash. Treat these rows and the other owned components for a target as one dependency: if the selected paginated database, anchor, protected-reference assessment, or target-row contract changes, retain that whole target before any of its components mutate. Independent targets may continue. At apply time revalidate the fresh execution snapshot, selected main-file identity, schema signature, target-reference inventory, and row contracts before the first dependent mutation; delete only unchanged approved rows and accept already-absent rows.
+- For paginated targets, freeze every owned projection/turn/item row and every shadow-observed target-contained side effect by row identity/content digest. If the database identity, anchor, effect envelope, or selected row contract changes, retain that dependent target before mutation; independent targets may continue.
 - Evaluate every discovered auxiliary database separately. Freeze its anchor assessment, compatibility evidence, target-row identities, and expected-preserved contract. A skipped auxiliary database must not suppress mutations in a different compatible auxiliary database.
 - Preserve malformed or invalid-UTF-8 index content and skip index mutation; continue other components.
-- Preserve incompatible SQLite anchors, mutation-affecting triggers, target-bearing unknown storage, ambiguous generations, and unreadable objects. Accept structurally compatible extensions and preserve their rows unchanged.
-- Preserve symlinks, multiply linked managed files, paths escaping the selected Codex home, and artifacts with ambiguous multi-session ownership. Never follow them.
+- Preserve incompatible SQLite anchors, escaping or residual shadow effects, ambiguous generations, and unreadable objects. Accept target-contained trigger/foreign-key behavior proved by the frozen shadow envelope.
+- Preserve symlinks, multiply linked managed files, and paths escaping the selected Codex home. Treat exact state `rollout_path` references as authoritative ownership; filename UUIDs are only hints. Preserve a multi-UUID path only when authoritative ownership is conflicting or indeterminate.
 - Bind approved regular files by device, inode, type, mtime, size, and SHA-256. Isolate exact leaves atomically and remove directories only when empty.
 - Preserve prompt-history text as non-owning evidence. Remove only recognized or unambiguously discovered exact structured references.
 - Treat a nonstandard realtime-voice selector as a warning; clear it only when its complete value is unambiguously target-owned.
@@ -126,7 +126,7 @@ Keep historical cleanup separate from target deletion. Scan only when authoritat
 
 Ordinary residuals include exact orphan index rows, rollout files, snapshots, generated artifacts, log rows, and state references without a matching state thread. State threads missing rollout files are a separate scope.
 
-Freeze exact report-time historical identities and the runtime extension assessment. Delete unchanged approved objects; treat already-absent objects as satisfied; preserve identity-changed replacements and all later additions. If a residual becomes a live state thread or gains an unknown-schema reference, preserve it and report the changed classification. Exclude point-in-time Desktop owner process observations from the approval fingerprint; they are rechecked as an apply gate and do not define the deletion set.
+Freeze exact report-time historical identities and the runtime extension assessment. Delete unchanged approved objects; treat already-absent objects as satisfied; preserve identity-changed replacements and all later additions. Recompute artifact ownership inside the locked prewrite boundary from the authoritative state-thread set: several UUID hints are acceptable when exactly one live state thread matches, and that live-owned artifact is preserved. If a residual becomes a live state thread or gains an unknown-schema reference, preserve it and report the changed classification. Exclude point-in-time Desktop owner process observations from the approval fingerprint; they are rechecked as an apply gate and do not define the deletion set. Any non-empty historical cleanup is Desktop-owned mutation because it may change state/log databases and therefore requires the offline path.
 
 An authoritative approved historical snapshot with no object identities is satisfied without invoking historical mutation. Its verification is independent of later unapproved residuals and must not become `partial_possible` merely because a new global historical scan is unavailable after target deletion.
 
@@ -152,8 +152,8 @@ Offline verification is complete before Desktop reopens. A post-reopen report is
 The `0600` request and receipt are cross-process recovery material while Desktop is closed. They are transient operational state, not a permanent audit archive.
 
 - Retain the receipt after failure, partial completion, or a strict-cleanup anomaly so diagnosis and recovery remain possible.
-- A restaged successor may explicitly inherit a bounded chain of terminal failed job IDs. Validate every predecessor under the same private job root and Codex-home boundary; never discover deletion candidates by broad directory age or globbing.
-- After `complete` plus deletion and verification success, print the Ghostty result first, then remove failed predecessors and the current job.
+- A restaged successor may explicitly inherit a bounded chain of terminal pre-mutation failed job IDs. A partially mutated job requires its separate supported recovery classification and must be recorded as an exact recovery predecessor; never discover deletion candidates by broad directory age or globbing.
+- After `complete` plus deletion and verification success, print the Ghostty result first, then remove validated pre-mutation predecessors, an explicitly recorded still-eligible recovery predecessor, and the current job.
 - Cleanup accepts only same-user `0700` real job directories containing the single-link `0600` receipt and optional inactive worker/launch locks. The approval request must already be absent.
 - A symbolic link, unexpected entry, active lock, owner/mode mismatch, unsupported receipt, cross-home lineage, or concurrent change stops cleanup. Retain the current success receipt with `cleanup_pending`; do not recursively force removal.
 - `cleanup-completed` may retry only this strict metadata cleanup. It never reruns deletion and does not require a second deletion approval.

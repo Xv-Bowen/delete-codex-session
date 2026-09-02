@@ -35,8 +35,8 @@ UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 UUID_BYTES_RE = re.compile(UUID_RE.pattern.encode("ascii"))
-SCRIPT_VERSION = "3.4"
-PLAN_CONTRACT_VERSION = 13
+SCRIPT_VERSION = "4.0"
+PLAN_CONTRACT_VERSION = 14
 APPROVAL_CONTRACT_VERSION = 4
 APPROVAL_SCOPE_CONTRACT_VERSION = 2
 MAX_APPROVAL_PAYLOAD_BYTES = 1024 * 1024
@@ -387,6 +387,7 @@ class Plan:
     target_edge_rows: list[dict[str, str]] = field(default_factory=list)
     initial_state_thread_ids: set[str] = field(default_factory=set)
     artifact_contracts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    artifact_ownership_evidence: list[dict[str, Any]] = field(default_factory=list)
     desktop_catalog_path: Path | None = None
     desktop_catalog_rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     desktop_catalog_schema_signature: str = ""
@@ -1014,6 +1015,339 @@ def runtime_schema_target_issues(
     return issues
 
 
+class MutationEffectIndeterminate(RuntimeError):
+    """A shadow mutation could not produce a complete, bounded effect envelope."""
+
+
+def sqlite_value_size(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, str):
+        return len(value.encode("utf-8", errors="replace"))
+    return len(repr(value).encode("utf-8", errors="replace"))
+
+
+def sqlite_reference_ids(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {match.lower() for match in UUID_RE.findall(value)}
+    if isinstance(value, bytes):
+        return {
+            match.decode("ascii").lower() for match in UUID_BYTES_RE.findall(value)
+        }
+    return set()
+
+
+def mutation_dependency_objects(
+    conn: sqlite3.Connection,
+    anchor_tables: set[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Describe schema objects that can extend a mutation beyond its direct SQL.
+
+    Presence alone is evidence, not a blocker.  The caller decides safety from a
+    shadow execution of the actual mutation.
+    """
+
+    triggers: list[dict[str, Any]] = []
+    for name, table, sql in conn.execute(
+        "SELECT name, tbl_name, sql FROM sqlite_master "
+        "WHERE type='trigger' ORDER BY name"
+    ):
+        normalized_sql = re.sub(r"\s+", " ", str(sql or "").strip())
+        lowered_sql = normalized_sql.lower()
+        if str(table) in anchor_tables or any(
+            re.search(rf"\b{re.escape(candidate.lower())}\b", lowered_sql)
+            for candidate in anchor_tables
+        ):
+            triggers.append(
+                {
+                    "name": str(name),
+                    "table": str(table),
+                    "sql": normalized_sql,
+                    "sql_sha256": normalized_sql_hash(normalized_sql),
+                }
+            )
+
+    foreign_keys: list[dict[str, Any]] = []
+    for table in sorted(user_tables(conn)):
+        for row in conn.execute(f"PRAGMA foreign_key_list({quote_ident(table)})"):
+            referenced_table = str(row[2])
+            if table not in anchor_tables and referenced_table not in anchor_tables:
+                continue
+            foreign_keys.append(
+                {
+                    "table": table,
+                    "column": str(row[3]),
+                    "referenced_table": referenced_table,
+                    "referenced_column": str(row[4]),
+                    "on_update": str(row[5]),
+                    "on_delete": str(row[6]),
+                }
+            )
+    return {"triggers": triggers, "foreign_keys": foreign_keys}
+
+
+def mutation_effect_snapshot(
+    conn: sqlite3.Connection,
+    known_tables: set[str],
+    known_thread_references: set[tuple[str, str]],
+) -> dict[str, Any]:
+    scanned_bytes = 0
+    tables: dict[str, Any] = {}
+    for table in sorted(user_tables(conn)):
+        column_names = ordered_columns(conn, table)
+        primary_key = primary_key_columns(conn, table)
+        positions = {name: index for index, name in enumerate(column_names)}
+        reference_columns = {
+            column
+            for candidate_table, column in known_thread_references
+            if candidate_table == table and column in positions
+        }
+        if table not in known_tables:
+            reference_columns.update(column_names)
+        else:
+            reference_columns.update(
+                column for column in column_names if is_thread_reference_column(column)
+            )
+        rows: dict[str, dict[str, Any]] = {}
+        duplicate_keys: dict[str, int] = {}
+        for row in conn.execute(f"SELECT * FROM {quote_ident(table)}"):
+            scanned_bytes += sum(sqlite_value_size(value) for value in row)
+            if scanned_bytes > MAX_RUNTIME_SCHEMA_SCAN_BYTES:
+                raise MutationEffectIndeterminate(
+                    "shadow effect scan exceeded the bounded inspection limit"
+                )
+            row_sha256 = sqlite_row_sha256(column_names, row)
+            if primary_key:
+                key_values = [row[positions[column]] for column in primary_key]
+                key = sqlite_row_sha256(primary_key, key_values)
+            else:
+                duplicate_index = duplicate_keys.get(row_sha256, 0)
+                duplicate_keys[row_sha256] = duplicate_index + 1
+                key = f"row:{row_sha256}:{duplicate_index}"
+            reference_ids: set[str] = set()
+            for column in reference_columns:
+                reference_ids.update(sqlite_reference_ids(row[positions[column]]))
+            rows[key] = {
+                "row_sha256": row_sha256,
+                "reference_ids": sorted(reference_ids),
+            }
+        tables[table] = {
+            "primary_key": primary_key,
+            "row_count": len(rows),
+            "rows": rows,
+        }
+    return {"tables": tables, "scanned_bytes": scanned_bytes}
+
+
+def mutation_effect_diff(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    target_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    effects: list[dict[str, Any]] = []
+    outside_scope: list[dict[str, Any]] = []
+    before_tables = before.get("tables", {})
+    after_tables = after.get("tables", {})
+    for table in sorted(set(before_tables) | set(after_tables)):
+        before_rows = before_tables.get(table, {}).get("rows", {})
+        after_rows = after_tables.get(table, {}).get("rows", {})
+        removed = 0
+        added = 0
+        changed = 0
+        target_owned = 0
+        escaped = 0
+        samples: list[dict[str, Any]] = []
+        change_contract: list[dict[str, Any]] = []
+        for key in sorted(set(before_rows) | set(after_rows)):
+            old = before_rows.get(key)
+            new = after_rows.get(key)
+            if old == new:
+                continue
+            old_refs = set(old.get("reference_ids", [])) if old else set()
+            new_refs = set(new.get("reference_ids", [])) if new else set()
+            if old is None:
+                change = "added"
+                added += 1
+                in_scope = False
+            elif new is None:
+                change = "removed"
+                removed += 1
+                in_scope = bool(old_refs & target_ids)
+            else:
+                change = "changed"
+                changed += 1
+                removed_targets = (old_refs - new_refs) & target_ids
+                introduced_refs = new_refs - old_refs
+                in_scope = bool(removed_targets) and not introduced_refs
+            if in_scope:
+                target_owned += 1
+            else:
+                escaped += 1
+                finding = {
+                    "table": table,
+                    "change": change,
+                    "before_reference_ids": sorted(old_refs),
+                    "after_reference_ids": sorted(new_refs),
+                    "row_key_sha256": key,
+                }
+                outside_scope.append(finding)
+                if len(samples) < 5:
+                    samples.append(finding)
+            change_contract.append(
+                {
+                    "row_key_sha256": key,
+                    "change": change,
+                    "before_row_sha256": old.get("row_sha256", "") if old else "",
+                    "after_row_sha256": new.get("row_sha256", "") if new else "",
+                    "before_reference_ids": sorted(old_refs),
+                    "after_reference_ids": sorted(new_refs),
+                }
+            )
+        if removed or added or changed:
+            effects.append(
+                {
+                    "table": table,
+                    "removed": removed,
+                    "added": added,
+                    "changed": changed,
+                    "target_owned_changes": target_owned,
+                    "outside_scope_changes": escaped,
+                    "outside_scope_samples": samples,
+                    "change_contract_sha256": json_value_sha256(change_contract),
+                }
+            )
+    return effects, outside_scope
+
+
+def sqlite_mutation_effect_assessment(
+    conn: sqlite3.Connection | None,
+    target_ids: Iterable[str],
+    known_tables: set[str],
+    known_thread_references: set[tuple[str, str]],
+    anchor_tables: set[str],
+    mutate: Any,
+    required_absent_tables: set[str] | None = None,
+) -> dict[str, Any]:
+    """Run the real mutation against an in-memory clone and classify its effects."""
+
+    targets = {
+        str(value).lower()
+        for value in target_ids
+        if isinstance(value, str) and CANONICAL_UUID_RE.fullmatch(value)
+    }
+    required_absent_tables = required_absent_tables or set()
+    if conn is None:
+        return {"status": "indeterminate", "reason": "database is unavailable"}
+    dependencies = mutation_dependency_objects(conn, anchor_tables)
+    if (
+        not dependencies["triggers"]
+        and not dependencies["foreign_keys"]
+        and not required_absent_tables
+    ):
+        return {
+            "status": "not_required",
+            "reason": "no trigger or foreign-key dependency extends the direct mutation",
+            **dependencies,
+        }
+    shadow = sqlite3.connect(":memory:")
+    try:
+        if conn.in_transaction:
+            database_rows = list(conn.execute("PRAGMA database_list"))
+            main_paths = [
+                Path(str(row[2]))
+                for row in database_rows
+                if str(row[1]) == "main" and row[2]
+            ]
+            if len(main_paths) != 1:
+                raise MutationEffectIndeterminate(
+                    "active transaction has no unique on-disk database identity"
+                )
+            source = connect_ro(main_paths[0])
+            if source is None:
+                raise MutationEffectIndeterminate(
+                    "active transaction database disappeared during shadow analysis"
+                )
+            try:
+                source.backup(shadow)
+            finally:
+                source.close()
+        else:
+            conn.backup(shadow)
+        shadow.execute("PRAGMA foreign_keys=ON")
+        before = mutation_effect_snapshot(
+            shadow,
+            known_tables,
+            known_thread_references,
+        )
+        shadow.execute("BEGIN")
+        mutation_result = mutate(shadow, sorted(targets))
+        quick_check = str(shadow.execute("PRAGMA quick_check").fetchone()[0])
+        after = mutation_effect_snapshot(
+            shadow,
+            known_tables,
+            known_thread_references,
+        )
+        effects, outside_scope = mutation_effect_diff(before, after, targets)
+        remaining_target_references: list[dict[str, Any]] = []
+        for table in sorted(required_absent_tables):
+            rows = after.get("tables", {}).get(table, {}).get("rows", {})
+            count = sum(
+                1
+                for row in rows.values()
+                if set(row.get("reference_ids", [])) & targets
+            )
+            if count:
+                remaining_target_references.append({"table": table, "rows": count})
+        if quick_check != "ok" or outside_scope:
+            status = "outside_scope"
+        elif remaining_target_references:
+            status = "target_residual"
+        else:
+            status = "target_only"
+        return {
+            "status": status,
+            "reason": (
+                "shadow execution changed only rows owned by the approved targets"
+                if status == "target_only"
+                else (
+                    "shadow execution left target references in runtime-discovered storage"
+                    if status == "target_residual"
+                    else "shadow execution changed rows outside the approved target ownership envelope"
+                )
+            ),
+            "quick_check": quick_check,
+            "mutation_result": mutation_result,
+            "effects": effects,
+            "outside_scope_change_count": len(outside_scope),
+            "outside_scope_samples": outside_scope[:20],
+            "remaining_target_references": remaining_target_references,
+            "scanned_bytes": int(before["scanned_bytes"]) + int(after["scanned_bytes"]),
+            "scan_limit_bytes_per_snapshot": MAX_RUNTIME_SCHEMA_SCAN_BYTES,
+            **dependencies,
+        }
+    except (MutationEffectIndeterminate, OSError, RuntimeError, sqlite3.Error) as exc:
+        return {
+            "status": "indeterminate",
+            "reason": str(exc),
+            **dependencies,
+        }
+    finally:
+        shadow.close()
+
+
+def mutation_effect_issues(database_label: str, assessment: dict[str, Any]) -> list[str]:
+    status = assessment.get("status")
+    if status in {"not_required", "target_only"}:
+        return []
+    dependency_kind = "trigger/foreign-key"
+    return [
+        f"Shadow execution of {database_label} {dependency_kind} effects was "
+        f"{status}: {assessment.get('reason', 'unknown effect')}."
+    ]
+
+
 def normalized_sql_hash(sql: str) -> str:
     normalized = re.sub(r"\s+", " ", sql.strip())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -1035,22 +1369,8 @@ def state_trigger_issues(state: sqlite3.Connection) -> list[str]:
             issues.append(
                 f"Unsupported or modified state trigger discovered: {trigger_name}."
             )
-        elif expected_hash is None:
-            lowered_sql = normalized_sql.lower()
-            touches_thread_storage = str(table) in {
-                location[0] for location in KNOWN_STATE_THREAD_REFERENCES
-            } | {"threads"} or any(
-                re.search(rf"\b{re.escape(candidate)}\b", lowered_sql)
-                for candidate in {
-                    location[0] for location in KNOWN_STATE_THREAD_REFERENCES
-                }
-                | {"threads"}
-            )
-            if touches_thread_storage:
-                issues.append(
-                    "Unsupported trigger can affect known thread storage: "
-                    f"{trigger_name}."
-                )
+        # Unknown triggers are assessed by executing the exact mutation against
+        # an in-memory clone.  Their presence is not itself evidence of danger.
     return issues
 
 
@@ -1146,11 +1466,44 @@ def state_runtime_mutation_issues(
     target_ids: Iterable[str],
 ) -> list[str]:
     assessment = state_schema_compatibility(state, target_ids)
+    effect_assessment = state_mutation_effect_assessment(state, target_ids)
+    extension_issues = (
+        []
+        if effect_assessment.get("status") == "target_only"
+        else runtime_schema_target_issues("state database", assessment)
+    )
     return sorted(
         dict.fromkeys(
             state_mutation_schema_issues(state)
-            + runtime_schema_target_issues("state database", assessment)
+            + extension_issues
+            + mutation_effect_issues("state database", effect_assessment)
         )
+    )
+
+
+def state_mutation_effect_assessment(
+    state: sqlite3.Connection | None,
+    target_ids: Iterable[str],
+) -> dict[str, Any]:
+    target_ids = list(target_ids)
+    compatibility = state_schema_compatibility(state, target_ids)
+    required_absent_tables = {
+        str(hit.get("table", ""))
+        for hit in compatibility.get("target_reference_hits", [])
+        if hit.get("table")
+    }
+    known_references = KNOWN_STATE_THREAD_REFERENCES | {
+        ("threads", "id"),
+    }
+    anchor_tables = {table for table, _column in known_references}
+    return sqlite_mutation_effect_assessment(
+        state,
+        target_ids,
+        KNOWN_STATE_TABLES,
+        known_references,
+        anchor_tables,
+        delete_state_rows_on_conn,
+        required_absent_tables,
     )
 
 
@@ -1994,7 +2347,6 @@ def paginated_history_anchor_issues(
     if conn is None:
         return [f"Paginated history database disappeared: {database_label}."]
     issues: list[str] = []
-    known_tables = set(PAGINATED_HISTORY_PRIMARY_KEYS)
     for table, required_columns in PAGINATED_HISTORY_REQUIRED_COLUMNS.items():
         if not table_exists(conn, table):
             issues.append(
@@ -2016,26 +2368,6 @@ def paginated_history_anchor_issues(
                 f"primary key {actual_pk}; expected {expected_pk}."
             )
 
-    for _object_type, name, trigger_table, sql in conn.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_master "
-        "WHERE type='trigger' ORDER BY name"
-    ):
-        normalized_sql = re.sub(r"\s+", " ", str(sql or "").strip()).lower()
-        if str(trigger_table) in known_tables or any(
-            re.search(rf"\b{re.escape(table.lower())}\b", normalized_sql)
-            for table in known_tables
-        ):
-            issues.append(
-                "Unsupported trigger can affect paginated thread history: "
-                f"{database_label}:{name}."
-            )
-    for table in sorted(user_tables(conn)):
-        for fk in conn.execute(f"PRAGMA foreign_key_list({quote_ident(table)})"):
-            if table in known_tables or str(fk[2]) in known_tables:
-                issues.append(
-                    "Unsupported foreign key can affect paginated thread history: "
-                    f"{database_label}:{table}.{fk[3]} -> {fk[2]}.{fk[4]}."
-                )
     issues.extend(
         reference_format_issues(
             conn,
@@ -2053,13 +2385,72 @@ def paginated_history_runtime_issues(
 ) -> tuple[list[str], dict[str, Any]]:
     compatibility = paginated_history_schema_compatibility(conn, candidate_ids)
     issues = paginated_history_anchor_issues(conn, database_label)
+    effect_assessment = paginated_history_mutation_effect_assessment(
+        conn,
+        candidate_ids,
+        compatibility,
+    )
+    compatibility["mutation_effect_assessment"] = effect_assessment
+    if effect_assessment.get("status") != "target_only":
+        issues.extend(
+            runtime_schema_target_issues(
+                f"paginated history database {database_label}",
+                compatibility,
+            )
+        )
     issues.extend(
-        runtime_schema_target_issues(
+        mutation_effect_issues(
             f"paginated history database {database_label}",
-            compatibility,
+            effect_assessment,
         )
     )
     return sorted(dict.fromkeys(issues)), compatibility
+
+
+def delete_paginated_history_rows_on_conn(
+    conn: sqlite3.Connection,
+    target_ids: list[str],
+) -> dict[str, int]:
+    removed: dict[str, int] = {}
+    for table in [
+        "thread_items",
+        "thread_turns",
+        "thread_history_projection_state",
+    ]:
+        cursor = conn.execute(
+            f"DELETE FROM {quote_ident(table)} "
+            f"WHERE lower(CAST(thread_id AS TEXT)) "
+            f"IN ({placeholders(target_ids)})",
+            target_ids,
+        )
+        removed[table] = int(cursor.rowcount)
+    return removed
+
+
+def paginated_history_mutation_effect_assessment(
+    conn: sqlite3.Connection | None,
+    target_ids: Iterable[str],
+    compatibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    target_ids = list(target_ids)
+    compatibility = compatibility or paginated_history_schema_compatibility(
+        conn,
+        target_ids,
+    )
+    required_absent_tables = {
+        str(hit.get("table", ""))
+        for hit in compatibility.get("target_reference_hits", [])
+        if hit.get("table")
+    }
+    return sqlite_mutation_effect_assessment(
+        conn,
+        target_ids,
+        PAGINATED_HISTORY_KNOWN_TABLES,
+        PAGINATED_HISTORY_THREAD_REFERENCES,
+        set(PAGINATED_HISTORY_PRIMARY_KEYS),
+        delete_paginated_history_rows_on_conn,
+        required_absent_tables,
+    )
 
 
 def paginated_history_row_contracts(
@@ -2175,6 +2566,9 @@ def paginated_history_database_assessment(
             "schema_signature": sqlite_schema_signature(conn, include_indexes=True),
             "primary_keys": PAGINATED_HISTORY_PRIMARY_KEYS,
             "rows": rows,
+            "mutation_effect_assessment": compatibility.get(
+                "mutation_effect_assessment", {}
+            ),
         }
         base["counts"] = {table: len(entries) for table, entries in rows.items()}
         base["contract"] = contract if not issues else {}
@@ -2212,6 +2606,20 @@ def filtered_paginated_history_contract(
             if isinstance(entries, list)
         }
     return filtered
+
+
+def paginated_prewrite_comparison_contract(value: Any) -> Any:
+    """Remove runtime scan counters that do not define deletion authority."""
+
+    if isinstance(value, dict):
+        return {
+            key: paginated_prewrite_comparison_contract(item)
+            for key, item in value.items()
+            if key != "scanned_bytes"
+        }
+    if isinstance(value, list):
+        return [paginated_prewrite_comparison_contract(item) for item in value]
+    return value
 
 
 def json_value_sha256(value: Any) -> str:
@@ -3046,6 +3454,8 @@ def safe_existing_file(
     allowed_root: Path,
     expected_session_id: str,
     unsafe: list[str],
+    ownership_evidence: list[dict[str, Any]] | None = None,
+    authoritative_owners_by_path: dict[str, list[str]] | None = None,
 ) -> Path | None:
     if not path_text:
         return None
@@ -3059,12 +3469,28 @@ def safe_existing_file(
         return None
     relative = path.relative_to(allowed_root)
     relative_ids = {match.lower() for match in UUID_RE.findall(str(relative))}
-    if path.suffix.lower() != ".jsonl" or relative_ids != {expected_session_id.lower()}:
+    if path.suffix.lower() != ".jsonl":
         unsafe.append(
-            "rollout path does not uniquely identify its owning session: "
+            "rollout path is not a JSONL session artifact: "
             f"{expected_session_id} -> {path}"
         )
         return None
+    owners = set((authoritative_owners_by_path or {}).get(str(path), []))
+    if owners and owners != {expected_session_id.lower()}:
+        unsafe.append(
+            "Managed rollout path has conflicting authoritative state owners: "
+            f"{path} -> {', '.join(sorted(owners))}"
+        )
+        return None
+    if ownership_evidence is not None and relative_ids != {expected_session_id.lower()}:
+        ownership_evidence.append(
+            {
+                "path": str(path),
+                "owner_session_id": expected_session_id.lower(),
+                "filename_session_id_hints": sorted(relative_ids),
+                "basis": "authoritative_state_rollout_path",
+            }
+        )
     if path.exists() and not path.is_file():
         unsafe.append(f"non-file rollout path: {path}")
         return None
@@ -3078,11 +3504,24 @@ def collect_files(plan: Plan) -> None:
     shell_root = plan.codex_home / "shell_snapshots"
     generated_root = plan.codex_home / "generated_images"
 
-    rollout_groups = rollout_paths_by_session(plan.codex_home, plan.unsafe_paths)
-    snapshot_groups = shell_snapshot_paths_by_session(
-        plan.codex_home, plan.unsafe_paths
+    rollout_groups = rollout_paths_by_session(
+        plan.codex_home,
+        plan.unsafe_paths,
+        plan.initial_state_thread_ids,
+        plan.artifact_ownership_evidence,
     )
-    generated_groups = generated_paths_by_session(plan.codex_home, plan.unsafe_paths)
+    snapshot_groups = shell_snapshot_paths_by_session(
+        plan.codex_home,
+        plan.unsafe_paths,
+        plan.initial_state_thread_ids,
+        plan.artifact_ownership_evidence,
+    )
+    generated_groups = generated_paths_by_session(
+        plan.codex_home,
+        plan.unsafe_paths,
+        plan.initial_state_thread_ids,
+        plan.artifact_ownership_evidence,
+    )
 
     rollout_files: list[Path] = paths_for_ids(rollout_groups, set(plan.target_ids))
     for thread in plan.threads.values():
@@ -3091,6 +3530,8 @@ def collect_files(plan: Plan) -> None:
             sessions_root,
             thread.id,
             plan.unsafe_paths,
+            plan.artifact_ownership_evidence,
+            plan.preflight.get("rollout_path_owners", {}),
         )
         if path is not None:
             rollout_files.append(path)
@@ -3098,9 +3539,21 @@ def collect_files(plan: Plan) -> None:
     shell_files = paths_for_ids(snapshot_groups, set(plan.target_ids))
     generated = paths_for_ids(generated_groups, set(plan.target_ids))
 
+    rollout_path_owners = plan.preflight.get("rollout_path_owners", {})
+    owned_rollout_files: list[Path] = []
+    for path in rollout_files:
+        owners = set(rollout_path_owners.get(str(path), []))
+        if len(owners) > 1:
+            plan.unsafe_paths.append(
+                "Managed rollout path has conflicting authoritative state owners: "
+                f"{path} -> {', '.join(sorted(owners))}"
+            )
+            continue
+        owned_rollout_files.append(path)
+
     plan.rollout_files = unique_paths(
         path
-        for path in rollout_files
+        for path in owned_rollout_files
         if path.is_file() and record_safe_path(path, sessions_root, plan.unsafe_paths)
     )
     plan.shell_snapshots = unique_paths(
@@ -3131,6 +3584,15 @@ def collect_files(plan: Plan) -> None:
         )
         if path_is_present(path)
     }
+    plan.artifact_ownership_evidence = [
+        json.loads(encoded)
+        for encoded in sorted(
+            {
+                json.dumps(item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                for item in plan.artifact_ownership_evidence
+            }
+        )
+    ]
 
 
 def dir_size(path: Path) -> int:
@@ -3548,11 +4010,7 @@ def rollout_migration_skipped_path_issues(
     ):
         path = str(raw_path)
         path_ids = {match.lower() for match in UUID_RE.findall(path)}
-        if len(path_ids) > 1:
-            issues.append(
-                "rollout_migration_skipped_rollouts contains a path with multiple "
-                f"session IDs: {path}"
-            )
+        if path in target_rollout_paths:
             continue
         if path_ids & target_ids and path not in target_rollout_paths:
             issues.append(
@@ -3568,7 +4026,18 @@ def state_rollout_path_issues(
 ) -> list[str]:
     sessions_root = codex_home / "sessions"
     issues: list[str] = []
-    for sid, rollout_path in state_thread_rollout_rows(state):
+    rollout_rows = state_thread_rollout_rows(state)
+    owners_by_path: dict[str, set[str]] = {}
+    for sid, rollout_path in rollout_rows:
+        if rollout_path:
+            owners_by_path.setdefault(rollout_path, set()).add(sid)
+    for rollout_path, owners in sorted(owners_by_path.items()):
+        if len(owners) > 1:
+            issues.append(
+                "Multiple state threads claim the same rollout_path: "
+                f"{rollout_path} -> {', '.join(sorted(owners))}"
+            )
+    for sid, rollout_path in rollout_rows:
         if not rollout_path:
             issues.append(f"State thread {sid} has an empty rollout_path.")
             continue
@@ -3577,20 +4046,13 @@ def state_rollout_path_issues(
             issues.append(f"State thread {sid} has a relative rollout_path: {path}")
             continue
         path_issue = path_within_root_issue(path, sessions_root)
-        relative_ids: set[str] = set()
-        if path_issue is None:
-            relative_ids = {
-                match.lower()
-                for match in UUID_RE.findall(str(path.relative_to(sessions_root)))
-            }
         if (
             path_issue is not None
             or path.suffix.lower() != ".jsonl"
             or (path.exists() and not path.is_file())
-            or relative_ids != {sid}
         ):
             issues.append(
-                f"State thread {sid} has a rollout_path that does not uniquely identify it: {path}"
+                f"State thread {sid} has an invalid rollout_path: {path}"
             )
     return issues
 
@@ -3615,6 +4077,8 @@ def artifact_session_id(
     path: Path,
     root: Path,
     unsafe: list[str] | None,
+    authoritative_session_ids: set[str] | None = None,
+    ownership_evidence: list[dict[str, Any]] | None = None,
 ) -> str | None:
     try:
         relative = path.relative_to(root)
@@ -3622,6 +4086,19 @@ def artifact_session_id(
         return
     session_ids = {match.lower() for match in UUID_RE.findall(str(relative))}
     if len(session_ids) > 1:
+        authoritative_matches = session_ids & (authoritative_session_ids or set())
+        if len(authoritative_matches) == 1:
+            owner = next(iter(authoritative_matches))
+            if ownership_evidence is not None:
+                ownership_evidence.append(
+                    {
+                        "path": str(path),
+                        "owner_session_id": owner,
+                        "filename_session_id_hints": sorted(session_ids),
+                        "basis": "unique_authoritative_state_match",
+                    }
+                )
+            return owner
         if unsafe is not None:
             unsafe.append(
                 "Managed artifact path contains multiple session IDs and has "
@@ -3636,14 +4113,25 @@ def add_path_for_session(
     path: Path,
     root: Path,
     unsafe: list[str] | None,
+    authoritative_session_ids: set[str] | None = None,
+    ownership_evidence: list[dict[str, Any]] | None = None,
 ) -> None:
-    sid = artifact_session_id(path, root, unsafe)
+    sid = artifact_session_id(
+        path,
+        root,
+        unsafe,
+        authoritative_session_ids,
+        ownership_evidence,
+    )
     if sid is not None:
         groups.setdefault(sid, []).append(str(path))
 
 
 def rollout_paths_by_session(
-    codex_home: Path, unsafe: list[str] | None = None
+    codex_home: Path,
+    unsafe: list[str] | None = None,
+    authoritative_session_ids: set[str] | None = None,
+    ownership_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
     groups: dict[str, list[str]] = {}
     root = codex_home / "sessions"
@@ -3662,12 +4150,22 @@ def rollout_paths_by_session(
             if not record_safe_path(path, root, unsafe):
                 continue
             if path.suffix == ".jsonl" and path.is_file():
-                add_path_for_session(groups, path, root, unsafe)
+                add_path_for_session(
+                    groups,
+                    path,
+                    root,
+                    unsafe,
+                    authoritative_session_ids,
+                    ownership_evidence,
+                )
     return groups
 
 
 def shell_snapshot_paths_by_session(
-    codex_home: Path, unsafe: list[str] | None = None
+    codex_home: Path,
+    unsafe: list[str] | None = None,
+    authoritative_session_ids: set[str] | None = None,
+    ownership_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
     groups: dict[str, list[str]] = {}
     root = codex_home / "shell_snapshots"
@@ -3677,12 +4175,22 @@ def shell_snapshot_paths_by_session(
         if not record_safe_path(path, root, unsafe):
             continue
         if path.suffix == ".sh" and path.is_file():
-            add_path_for_session(groups, path, root, unsafe)
+            add_path_for_session(
+                groups,
+                path,
+                root,
+                unsafe,
+                authoritative_session_ids,
+                ownership_evidence,
+            )
     return groups
 
 
 def generated_paths_by_session(
-    codex_home: Path, unsafe: list[str] | None = None
+    codex_home: Path,
+    unsafe: list[str] | None = None,
+    authoritative_session_ids: set[str] | None = None,
+    ownership_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
     groups: dict[str, list[str]] = {}
     directory_candidates: list[tuple[Path, str]] = []
@@ -3696,7 +4204,13 @@ def generated_paths_by_session(
             path = current_path / name
             if not record_safe_path(path, root, unsafe):
                 continue
-            sid = artifact_session_id(path, root, unsafe)
+            sid = artifact_session_id(
+                path,
+                root,
+                unsafe,
+                authoritative_session_ids,
+                ownership_evidence,
+            )
             if sid:
                 directory_candidates.append((path, sid))
             elif UUID_RE.search(str(path.relative_to(root))):
@@ -3708,7 +4222,14 @@ def generated_paths_by_session(
             if not record_safe_path(path, root, unsafe):
                 continue
             if path.is_file():
-                add_path_for_session(groups, path, root, unsafe)
+                add_path_for_session(
+                    groups,
+                    path,
+                    root,
+                    unsafe,
+                    authoritative_session_ids,
+                    ownership_evidence,
+                )
 
     collapsed_directories: list[Path] = []
     for directory, sid in sorted(
@@ -4125,22 +4646,36 @@ def scan_historical_residuals(
             + " | ".join(index_issues)
         )
 
-    unsafe_artifacts: list[str] = []
-    rollout_groups = rollout_paths_by_session(codex_home, unsafe_artifacts)
-    snapshot_groups = shell_snapshot_paths_by_session(codex_home, unsafe_artifacts)
-    generated_groups = generated_paths_by_session(codex_home, unsafe_artifacts)
-    if unsafe_artifacts:
-        return skipped_historical_scan(
-            "Historical cleanup is unavailable because symbolic-link or escaped artifact paths "
-            "were discovered: " + " | ".join(sorted(dict.fromkeys(unsafe_artifacts)))
-        )
-
     state_path = discovered_database_path(discover_state_database(codex_home))
     logs_path = discovered_database_path(discover_logs_database(codex_home))
     paginated_history_path = discovered_database_path(
         discover_paginated_history_database(codex_home)
     )
     state = connect_ro(state_path) if state_path is not None else None
+    authoritative_session_ids = state_thread_ids(state)
+    unsafe_artifacts: list[str] = []
+    rollout_groups = rollout_paths_by_session(
+        codex_home,
+        unsafe_artifacts,
+        authoritative_session_ids,
+    )
+    snapshot_groups = shell_snapshot_paths_by_session(
+        codex_home,
+        unsafe_artifacts,
+        authoritative_session_ids,
+    )
+    generated_groups = generated_paths_by_session(
+        codex_home,
+        unsafe_artifacts,
+        authoritative_session_ids,
+    )
+    if unsafe_artifacts:
+        if state is not None:
+            state.close()
+        return skipped_historical_scan(
+            "Historical cleanup is unavailable because symbolic-link or escaped artifact paths "
+            "were discovered: " + " | ".join(sorted(dict.fromkeys(unsafe_artifacts)))
+        )
     logs = (
         connect_ro(logs_path)
         if include_logs and logs_path is not None
@@ -5268,8 +5803,22 @@ def make_plan(
         plan.preflight["desktop_catalog_schema_compatibility"] = (
             desktop_compatibility
         )
-        state_runtime_issues = runtime_schema_target_issues(
-            "state database", state_compatibility
+        state_effect_assessment = state_mutation_effect_assessment(
+            state,
+            target_ids,
+        )
+        plan.preflight["state_mutation_effect_assessment"] = (
+            state_effect_assessment
+        )
+        state_runtime_issues = (
+            []
+            if state_effect_assessment.get("status") == "target_only"
+            else runtime_schema_target_issues(
+                "state database", state_compatibility
+            )
+        ) + mutation_effect_issues(
+            "state database",
+            state_effect_assessment,
         )
         logs_runtime_issues = runtime_schema_target_issues(
             "logs database", logs_compatibility
@@ -5396,6 +5945,14 @@ def make_plan(
                     f"Required auxiliary thread database is not writable: {path}"
                 )
         plan.initial_state_thread_ids = state_thread_ids(state)
+        rollout_path_owners: dict[str, list[str]] = {}
+        for owner_sid, owner_path in state_thread_rollout_rows(state):
+            if owner_path:
+                rollout_path_owners.setdefault(owner_path, []).append(owner_sid)
+        plan.preflight["rollout_path_owners"] = {
+            path: sorted(set(owners))
+            for path, owners in sorted(rollout_path_owners.items())
+        }
         protected_ids_encoded = "\n".join(sorted(plan.initial_state_thread_ids)).encode(
             "utf-8"
         )
@@ -6648,7 +7205,7 @@ def apply_target_paginated_history(
         )
     try:
         conn.execute("BEGIN IMMEDIATE")
-        issues, _compatibility = paginated_history_runtime_issues(
+        issues, compatibility = paginated_history_runtime_issues(
             conn,
             expected_path.name,
             plan.target_ids,
@@ -6662,6 +7219,14 @@ def apply_target_paginated_history(
         if current_signature != approved_contract.get("schema_signature"):
             raise RuntimeError(
                 "Paginated history schema identity changed after approval"
+            )
+        if paginated_prewrite_comparison_contract(
+            compatibility.get("mutation_effect_assessment", {})
+        ) != paginated_prewrite_comparison_contract(
+            approved_contract.get("mutation_effect_assessment", {})
+        ):
+            raise RuntimeError(
+                "Paginated history mutation effect envelope changed after approval"
             )
         current_rows = paginated_history_row_contracts(conn, plan.target_ids)
         already_absent = 0
@@ -6707,19 +7272,16 @@ def apply_target_paginated_history(
         )
         if expected_current_total:
             notify_mutation(mutation_observer, COMPONENT_PAGINATED_HISTORY)
+        rows_removed = delete_paginated_history_rows_on_conn(
+            conn,
+            plan.target_ids,
+        )
         for table in [
             "thread_items",
             "thread_turns",
             "thread_history_projection_state",
         ]:
             expected_count = len(current_rows.get(table, []))
-            cursor = conn.execute(
-                f"DELETE FROM {quote_ident(table)} "
-                f"WHERE lower(CAST(thread_id AS TEXT)) "
-                f"IN ({placeholders(plan.target_ids)})",
-                plan.target_ids,
-            )
-            rows_removed[table] = int(cursor.rowcount)
             if rows_removed[table] != expected_count:
                 raise RuntimeError(
                     f"Paginated history rows changed during deletion in {table}"
@@ -8668,17 +9230,29 @@ def cleanup_historical_residuals(
                 + " | ".join(canonical_issues)
             )
 
+        locked_state_ids = state_thread_ids(state_conn)
         unsafe_artifacts: list[str] = []
-        locked_rollouts = rollout_paths_by_session(codex_home, unsafe_artifacts)
-        locked_snapshots = shell_snapshot_paths_by_session(codex_home, unsafe_artifacts)
-        locked_generated = generated_paths_by_session(codex_home, unsafe_artifacts)
+        locked_rollouts = rollout_paths_by_session(
+            codex_home,
+            unsafe_artifacts,
+            authoritative_session_ids=locked_state_ids,
+        )
+        locked_snapshots = shell_snapshot_paths_by_session(
+            codex_home,
+            unsafe_artifacts,
+            authoritative_session_ids=locked_state_ids,
+        )
+        locked_generated = generated_paths_by_session(
+            codex_home,
+            unsafe_artifacts,
+            authoritative_session_ids=locked_state_ids,
+        )
         if unsafe_artifacts:
             raise RuntimeError(
                 "Artifact safety changed before historical cleanup: "
                 + " | ".join(sorted(dict.fromkeys(unsafe_artifacts)))
             )
 
-        locked_state_ids = state_thread_ids(state_conn)
         revived_ids = sorted(ordinary_no_state_ids & locked_state_ids)
         if revived_ids:
             raise RuntimeError(
@@ -9116,13 +9690,17 @@ def narrow_plan_for_execution(
     }
     paginated_dependency_changed = False
     if approved_paginated_targets:
-        current_paginated_contract = filtered_paginated_history_contract(
-            plan.paginated_history_contract,
-            approved_paginated_targets,
+        current_paginated_contract = paginated_prewrite_comparison_contract(
+            filtered_paginated_history_contract(
+                plan.paginated_history_contract,
+                approved_paginated_targets,
+            )
         )
-        approved_paginated_contract = filtered_paginated_history_contract(
-            object_contracts.get("paginated_history_contract", {}),
-            approved_paginated_targets,
+        approved_paginated_contract = paginated_prewrite_comparison_contract(
+            filtered_paginated_history_contract(
+                object_contracts.get("paginated_history_contract", {}),
+                approved_paginated_targets,
+            )
         )
         approved_paginated_path = object_contracts.get(
             "paginated_history_database_path", ""
@@ -9135,8 +9713,12 @@ def narrow_plan_for_execution(
         paginated_dependency_changed = (
             current_paginated_contract != approved_paginated_contract
             or current_paginated_path != approved_paginated_path
-            or plan.paginated_history_database_plan
-            != object_contracts.get("paginated_history_database_plan", {})
+            or paginated_prewrite_comparison_contract(
+                plan.paginated_history_database_plan
+            )
+            != paginated_prewrite_comparison_contract(
+                object_contracts.get("paginated_history_database_plan", {})
+            )
         )
     if paginated_dependency_changed:
         message = (
@@ -9196,6 +9778,8 @@ def narrow_plan_for_execution(
     if (
         current_thread_contract != approved_thread_contract
         or current_edges != approved_edges
+        or plan.preflight.get("state_mutation_effect_assessment", {})
+        != object_contracts.get("state_mutation_effect_assessment", {})
     ):
         message = (
             "Target graph or thread storage changed after approval; the core state/index "
@@ -9433,13 +10017,17 @@ def narrow_plan_for_execution(
             )
         )
 
-    filtered_paginated = filtered_paginated_history_contract(
-        plan.paginated_history_contract,
-        executable_targets,
+    filtered_paginated = paginated_prewrite_comparison_contract(
+        filtered_paginated_history_contract(
+            plan.paginated_history_contract,
+            executable_targets,
+        )
     )
-    approved_paginated = filtered_paginated_history_contract(
-        object_contracts.get("paginated_history_contract", {}),
-        executable_targets,
+    approved_paginated = paginated_prewrite_comparison_contract(
+        filtered_paginated_history_contract(
+            object_contracts.get("paginated_history_contract", {}),
+            executable_targets,
+        )
     )
     approved_paginated_path = object_contracts.get(
         "paginated_history_database_path", ""
@@ -9458,8 +10046,12 @@ def narrow_plan_for_execution(
     if active_paginated_targets and (
         filtered_paginated != approved_paginated
         or current_paginated_path != approved_paginated_path
-        or plan.paginated_history_database_plan
-        != object_contracts.get("paginated_history_database_plan", {})
+        or paginated_prewrite_comparison_contract(
+            plan.paginated_history_database_plan
+        )
+        != paginated_prewrite_comparison_contract(
+            object_contracts.get("paginated_history_database_plan", {})
+        )
     ):
         message = "Paginated history target contracts changed after approval."
         effective_components[COMPONENT_PAGINATED_HISTORY] = {
@@ -9624,7 +10216,10 @@ def _apply_plan_with_global_lock_held(
                 ),
             }
         )
-    if plan_desktop_mutation_components(effective_plan):
+    historical_desktop_work = apply_historical_residuals and (
+        historical_snapshot_has_approved_work(approved_historical_residuals)
+    )
+    if plan_desktop_mutation_components(effective_plan) or historical_desktop_work:
         owners, owner_issue = desktop_owner_processes(effective_plan.codex_home)
         if owner_issue:
             raise DesktopOfflineGate(owner_issue, "final_approve_and_launch")
@@ -10160,13 +10755,14 @@ def _apply_plan_with_global_lock_held(
         component_results.get(component, {}).get("status") == "completed"
         for component in approved_target_work_components
     )
-    accounted_historical_work = apply_historical_residuals and (
-        approved_historical_snapshot_empty
-        or (
-            historical_snapshot_has_approved_work(approved_historical_residuals)
-            and component_results.get(COMPONENT_HISTORICAL, {}).get("status")
-            == "completed"
-        )
+    # An empty approved historical snapshot satisfies historical verification,
+    # but it is not executed work. Counting it here could turn an all-target
+    # prewrite skip into a false completed_with_warnings result.
+    accounted_historical_work = (
+        apply_historical_residuals
+        and historical_snapshot_has_approved_work(approved_historical_residuals)
+        and component_results.get(COMPONENT_HISTORICAL, {}).get("status")
+        == "completed"
     )
     accounted_work = (
         accounted_target_work
@@ -10228,7 +10824,10 @@ def apply_plan(
         frozen_snapshot,
         force_open,
     )
-    if plan_desktop_mutation_components(preview_plan):
+    historical_desktop_work = apply_historical_residuals and (
+        historical_snapshot_has_approved_work(approved_historical_residuals)
+    )
+    if plan_desktop_mutation_components(preview_plan) or historical_desktop_work:
         owners, owner_issue = desktop_owner_processes(preview_plan.codex_home)
         if owner_issue:
             raise DesktopOfflineGate(owner_issue, "final_approve_and_launch")
@@ -10463,6 +11062,7 @@ def plan_contract(plan: Plan) -> dict[str, Any]:
         "generated_artifacts": path_contract(
             plan.generated_artifacts, plan.artifact_contracts
         ),
+        "artifact_ownership_evidence": plan.artifact_ownership_evidence,
         "unsafe_paths": sorted(plan.unsafe_paths),
         "blockers": sorted(plan.blockers),
         "safety_warnings": plan.safety_warnings,
@@ -10725,6 +11325,9 @@ def approval_execution_snapshot(plan: Plan, force_open: bool) -> dict[str, Any]:
             in executable_target_set
         ],
         "target_counts": target_counts,
+        "state_mutation_effect_assessment": plan.preflight.get(
+            "state_mutation_effect_assessment", {}
+        ),
         "session_index_rows": target_index_contracts,
         "log_rows": target_log_contracts,
         "artifact_contracts": {
@@ -11522,6 +12125,7 @@ def plan_to_dict(plan: Plan) -> dict[str, Any]:
         "rollout_files": [str(path) for path in plan.rollout_files],
         "shell_snapshots": [str(path) for path in plan.shell_snapshots],
         "generated_artifacts": [str(path) for path in plan.generated_artifacts],
+        "artifact_ownership_evidence": plan.artifact_ownership_evidence,
         "unsafe_paths": plan.unsafe_paths,
         "warnings": plan.warnings,
         "historical_residuals": plan.historical_residuals,
@@ -11919,6 +12523,10 @@ def main() -> int:
     approved_offline_components = execution_snapshot_desktop_mutation_components(
         execution_snapshot
     )
+    if args.apply_historical_residuals and historical_snapshot_has_approved_work(
+        approved_historical_residuals
+    ):
+        approved_offline_components.add(COMPONENT_HISTORICAL)
     if approved_offline_components:
         owners, owner_issue = desktop_owner_processes(plan.codex_home)
         if owner_issue:

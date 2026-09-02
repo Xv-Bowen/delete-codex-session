@@ -130,6 +130,17 @@ ALLOWED_NEXT_ACTIONS = {
     NEXT_NONE,
 }
 
+RETRYABLE_PREMUTATION_PHASES = {
+    "reading_staged_request",
+    "request_validated_pending_manual_exit",
+    "launch_delay",
+    "waiting_for_manual_exit",
+    "waiting_for_offline",
+    "offline_observed",
+    "manual_offline_wait_failed",
+    "terminal_launch_failed_before_worker",
+}
+
 REQUEST_KEYS = {
     "schema_version",
     "protocol_version",
@@ -688,6 +699,7 @@ def approved_desktop_mutation_components(
     core: types.ModuleType,
     plan: Any,
     execution_snapshot: dict[str, Any] | None,
+    historical_snapshot: dict[str, Any] | None = None,
 ) -> list[str]:
     """Return Desktop-owned components in the approved executable snapshot."""
 
@@ -701,7 +713,15 @@ def approved_desktop_mutation_components(
             raise HelperError(
                 "The core returned an unsupported approved Desktop component set."
             )
-        return sorted(dict.fromkeys(str(item) for item in detected if str(item)))
+        components = {str(item) for item in detected if str(item)}
+        historical_detector = getattr(
+            core, "historical_snapshot_has_approved_work", None
+        )
+        if callable(historical_detector) and historical_detector(
+            historical_snapshot or {}
+        ):
+            components.add("historical")
+        return sorted(components)
 
     preflight = plan_field(plan, "preflight", {})
     if isinstance(preflight, dict) and preflight.get("desktop_offline_required"):
@@ -1039,8 +1059,11 @@ def preflight_approved_request(request: dict[str, Any]) -> dict[str, Any]:
             execution_snapshot = {}
         component_summary = plan_component_summary(plan, execution_snapshot)
         execution_summary = plan_execution_summary(plan, execution_snapshot)
+        historical_snapshot = approval_payload.get("historical_snapshot", {})
+        if not isinstance(historical_snapshot, dict):
+            historical_snapshot = {}
         desktop_mutation_components = approved_desktop_mutation_components(
-            core, plan, execution_snapshot
+            core, plan, execution_snapshot, historical_snapshot
         )
         desktop_offline_required = bool(desktop_mutation_components)
         current_missing_rollout_sessions = (
@@ -1101,10 +1124,33 @@ def outer_app_bundle(executable: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def desktop_process_role(
+    bundle: Path,
+    executable: Path,
+    bundle_executable: Any,
+) -> str:
+    """Classify whether a bundle process can own mutable Codex session state."""
+
+    if (
+        isinstance(bundle_executable, str)
+        and executable == bundle / "Contents" / "MacOS" / bundle_executable
+    ):
+        return "main_application"
+    if executable == bundle / "Contents" / "Resources" / "codex":
+        return "session_backend"
+    return "auxiliary"
+
+
 def desktop_owner_processes(
     bundle_id: str = DEFAULT_BUNDLE_ID,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Return same-user processes running from the approved outer app bundle."""
+    """Return same-user processes with evidence of mutable Desktop-state ownership.
+
+    Merely running from the application bundle is not ownership evidence. Crash
+    reporters, renderers, network services, plugin hosts, and other auxiliaries may
+    legitimately outlive the main application and do not own the approved session
+    catalog. The main application and the embedded Codex session backend do.
+    """
 
     try:
         completed = subprocess.run(  # noqa: S603 - absolute system binary, fixed argv
@@ -1140,6 +1186,14 @@ def desktop_owner_processes(
                 issues.append(f"Unable to validate Desktop bundle for PID {pid}.")
             continue
         if actual_bundle_id == bundle_id:
+            executable_path = Path(executable)
+            process_role = desktop_process_role(
+                bundle,
+                executable_path,
+                bundle_executable,
+            )
+            if process_role == "auxiliary":
+                continue
             owners.append(
                 {
                     "pid": pid,
@@ -1147,9 +1201,8 @@ def desktop_owner_processes(
                     "executable": executable,
                     "bundle_path": str(bundle),
                     "bundle_id": actual_bundle_id,
-                    "is_main_application": isinstance(bundle_executable, str)
-                    and Path(executable)
-                    == bundle / "Contents" / "MacOS" / bundle_executable,
+                    "process_role": process_role,
+                    "is_main_application": process_role == "main_application",
                 }
             )
         elif bundle.name in {"ChatGPT.app", "Codex.app"}:
@@ -2100,11 +2153,48 @@ def run_worker(job_dir: Path) -> int:
             automatic_restart_requested=False,
         )
 
+        last_progress_signature: tuple[tuple[int, str], ...] | None = None
+
+        def show_offline_progress(current_owners: list[dict[str, Any]]) -> None:
+            nonlocal last_progress_signature
+            signature = tuple(
+                sorted(
+                    (
+                        int(owner.get("pid", 0) or 0),
+                        str(owner.get("process_role", "state_owner")),
+                    )
+                    for owner in current_owners
+                )
+            )
+            if signature == last_progress_signature:
+                return
+            last_progress_signature = signature
+            if current_owners:
+                roles = ", ".join(
+                    sorted(
+                        {
+                            str(owner.get("process_role", "state_owner"))
+                            for owner in current_owners
+                        }
+                    )
+                )
+                print(
+                    "仍在等待状态所有者退出："
+                    f"{len(current_owners)} 个（{roles}）。",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[2/4] 已检测到桌面状态所有者离线，正在确认稳定状态。",
+                    flush=True,
+                )
+
         offline = wait_for_desktop_offline(
             request["restart"]["bundle_id"],
             request["timing"]["quit_timeout_seconds"],
             request["timing"]["offline_stability_seconds"],
             request["timing"]["poll_interval_seconds"],
+            sample_callback=show_offline_progress,
         )
         if offline.get("detection_issue_samples"):
             writer.add_notice(
@@ -2166,6 +2256,10 @@ def run_worker(job_dir: Path) -> int:
             outcome=OUTCOME_WAITING_OFFLINE,
             next_action=NEXT_INSPECT_NO_RELAUNCH,
             plan_revalidated=False,
+        )
+        print(
+            "[3/4] 离线状态稳定且私有请求已核验，正在删除批准对象并完成验证。",
+            flush=True,
         )
         result = invoke_core_main(core, request, token, writer)
         summary = summarize_core_payload(result.payload, token)
@@ -2817,6 +2911,22 @@ def cleanup_job_ids_from_receipt(receipt: dict[str, Any]) -> list[str]:
     return list(raw)
 
 
+def recovery_job_ids_from_receipt(receipt: dict[str, Any]) -> list[str]:
+    raw = receipt.get("recovery_job_ids", [])
+    if raw is None:
+        raw = []
+    lineage = cleanup_job_ids_from_receipt(receipt)
+    if (
+        not isinstance(raw, list)
+        or len(raw) > 1
+        or any(not isinstance(item, str) or not JOB_ID_RE.fullmatch(item) for item in raw)
+        or raw != list(dict.fromkeys(raw))
+        or any(item not in lineage for item in raw)
+    ):
+        raise HelperError("The receipt contains an invalid recovery lineage.")
+    return list(raw)
+
+
 def acquire_existing_cleanup_lock(path: Path) -> int:
     secure_regular_file(path)
     flags = os.O_RDWR
@@ -2860,6 +2970,9 @@ TARGET_ABSENCE_COUNT_KEYS = {
     "generated_artifacts",
     "global_state_structural_refs",
     "logs_rows",
+    "paginated_history_item_rows",
+    "paginated_history_projection_rows",
+    "paginated_history_turn_rows",
     "rollout_files",
     "session_index_rows",
     "shell_snapshots",
@@ -2943,6 +3056,127 @@ def empty_historical_recovery_candidate(receipt: dict[str, Any]) -> bool:
     )
 
 
+def recoverable_skipped_historical_component(receipt: dict[str, Any]) -> bool:
+    """Whether only approved historical cleanup remains after verified target deletion."""
+
+    if (
+        receipt.get("terminal") is not True
+        or receipt.get("mutation_started") is not True
+        or receipt.get("phase") != "partial_or_verification_failed"
+        or receipt.get("outcome") != OUTCOME_PARTIAL_POSSIBLE
+        or receipt.get("owner_reappeared") is True
+        or receipt.get("request_integrity_verified") is not True
+        or receipt.get("plan_revalidated") is not True
+        or receipt.get("request_consumed") is not True
+        or receipt.get("verification_ok") is not True
+        or receipt.get("deletion_success") is True
+        or receipt.get("permanent_deletion_complete") is True
+        or receipt.get("errors")
+    ):
+        return False
+
+    request = receipt.get("request", {})
+    options = request.get("options", {}) if isinstance(request, dict) else {}
+    staged = receipt.get("staged_plan", {})
+    historical = staged.get("historical_residuals", {}) if isinstance(staged, dict) else {}
+    if (
+        not isinstance(options, dict)
+        or options.get("apply_historical_residuals") is not True
+        or options.get("apply_missing_rollout_threads") is True
+        or not isinstance(historical, dict)
+        or historical.get("scanned") is not True
+        or int(historical.get("total_ids", 0) or 0) <= 0
+        or int(historical.get("total_items", 0) or 0) <= 0
+        or historical.get("has_residuals") is not True
+    ):
+        return False
+
+    core_receipt = receipt.get("core", {})
+    core_result = (
+        core_receipt.get("result", {}) if isinstance(core_receipt, dict) else {}
+    )
+    apply_result = (
+        core_result.get("apply_result", {}) if isinstance(core_result, dict) else {}
+    )
+    verification = (
+        apply_result.get("verification", {})
+        if isinstance(apply_result, dict)
+        else {}
+    )
+    historical_cleanup = (
+        apply_result.get("historical_cleanup", {})
+        if isinstance(apply_result, dict)
+        else {}
+    )
+    component_results = (
+        apply_result.get("component_results", {})
+        if isinstance(apply_result, dict)
+        else {}
+    )
+    historical_component = (
+        component_results.get("historical", {})
+        if isinstance(component_results, dict)
+        else {}
+    )
+    component_summary = receipt.get("component_summary", {})
+    residual_counts = (
+        verification.get("residual_counts", {})
+        if isinstance(verification, dict)
+        else {}
+    )
+    integrity_checks = (
+        verification.get("integrity_checks", {})
+        if isinstance(verification, dict)
+        else {}
+    )
+    auxiliary_checks = (
+        integrity_checks.get("auxiliary_thread_databases", {})
+        if isinstance(integrity_checks, dict)
+        else {}
+    )
+    required_integrity = [
+        integrity_checks.get(key) if isinstance(integrity_checks, dict) else None
+        for key in ["state", "logs", "desktop_catalog", "paginated_history"]
+    ]
+    if (
+        not isinstance(apply_result, dict)
+        or apply_result.get("outcome") != OUTCOME_PARTIAL_POSSIBLE
+        or apply_result.get("mutation_started") is not True
+        or apply_result.get("historical_scan_ok") is not False
+        or not isinstance(verification, dict)
+        or verification.get("verification_ok") is not True
+        or verification.get("historical_snapshot_ok") is not False
+        or verification.get("offline_verification_ok") is not True
+        or verification.get("verification_errors")
+        or verification.get("planned_deleted_remaining")
+        or verification.get("expected_preserved_missing")
+        or verification.get("unexpected_remaining")
+        or verification.get("unexpected_non_target_removed")
+        or verification.get("remaining_rollout_files")
+        or verification.get("remaining_shell_snapshots")
+        or verification.get("remaining_generated_artifacts")
+        or not isinstance(residual_counts, dict)
+        or any(int(value or 0) != 0 for value in residual_counts.values())
+        or any(value != "ok" for value in required_integrity)
+        or not isinstance(auxiliary_checks, dict)
+        or any(value != "ok" for value in auxiliary_checks.values())
+        or not isinstance(historical_cleanup, dict)
+        or historical_cleanup.get("applied") is not False
+        or not isinstance(historical_component, dict)
+        or historical_component.get("status") != "skipped_safely"
+        or historical_component.get("mutation_started") is not False
+        or not isinstance(component_summary, dict)
+        or int(component_summary.get("failed_component_count", -1)) != 0
+        or not isinstance(component_results, dict)
+        or any(
+            isinstance(result, dict) and result.get("status") == "failed"
+            for result in component_results.values()
+        )
+    ):
+        return False
+    return True
+
+
 def inactive_job_locks(job_dir: Path) -> tuple[bool, str]:
     descriptors: list[int] = []
     try:
@@ -2959,6 +3193,99 @@ def inactive_job_locks(job_dir: Path) -> tuple[bool, str]:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+
+def inactive_premutation_assessment(
+    job_dir: Path,
+    receipt: dict[str, Any],
+    *,
+    locks_inactive: bool | None = None,
+) -> dict[str, Any]:
+    """Derive a safe action for an inactive worker before request consumption."""
+
+    phase = str(receipt.get("phase", ""))
+    if (
+        receipt.get("terminal") is True
+        or receipt.get("mutation_started") is True
+        or receipt.get("request_consumed") is True
+        or phase not in RETRYABLE_PREMUTATION_PHASES
+    ):
+        return {"eligible": False}
+    if locks_inactive is None:
+        locks_inactive, lock_reason = inactive_job_locks(job_dir)
+    else:
+        lock_reason = ""
+    if not locks_inactive:
+        return {
+            "eligible": True,
+            "retryable": False,
+            "next_action": NEXT_QUIT_AND_WAIT,
+            "reason": lock_reason or "The offline worker is still active.",
+        }
+    try:
+        raw = read_private_bytes(job_dir / REQUEST_FILENAME)
+        expected_sha = receipt.get("request_sha256")
+        if not isinstance(expected_sha, str) or sha256_bytes(raw) != expected_sha:
+            raise RequestError("The unconsumed request no longer matches its receipt.")
+        try:
+            decoded = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise RequestError("The unconsumed request is invalid JSON.") from exc
+        request = validate_request(decoded, job_dir)
+        if now_epoch_ms() >= request["expires_at_epoch_ms"]:
+            return {
+                "eligible": True,
+                "retryable": False,
+                "next_action": NEXT_RESTAGE,
+                "reason": "The approved request expired before mutation.",
+            }
+        verify_source_contract(request)
+    except (OSError, HelperError, UnicodeError, json.JSONDecodeError) as exc:
+        return {
+            "eligible": True,
+            "retryable": False,
+            "next_action": NEXT_RESTAGE,
+            "reason": str(exc),
+        }
+    finally:
+        if "request" in locals():
+            request["approval_token"] = ""
+    return {
+        "eligible": True,
+        "retryable": True,
+        "next_action": NEXT_RETRY_LAUNCH,
+        "reason": (
+            "The prior worker is inactive; the request is unconsumed, valid, "
+            "unexpired, and source-bound."
+        ),
+    }
+
+
+def receipt_with_runtime_action(
+    job_dir: Path,
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Add read-only worker-liveness evidence to the stable receipt action."""
+
+    enriched = receipt_with_stable_action(receipt)
+    assessment = inactive_premutation_assessment(job_dir, receipt)
+    if assessment.get("eligible") is not True:
+        return enriched
+    enriched["worker_active"] = assessment.get("retryable") is False and assessment.get(
+        "next_action"
+    ) == NEXT_QUIT_AND_WAIT
+    enriched["liveness_reason"] = assessment.get("reason", "")
+    if assessment.get("retryable") is True:
+        enriched["outcome"] = OUTCOME_RETRYABLE_WARNING
+        enriched["next_action"] = NEXT_RETRY_LAUNCH
+        enriched["retryable"] = True
+        enriched["safe_to_reopen"] = True
+    elif assessment.get("next_action") == NEXT_RESTAGE:
+        enriched["outcome"] = OUTCOME_RESTAGE_REQUIRED
+        enriched["next_action"] = NEXT_RESTAGE
+        enriched["retryable"] = False
+        enriched["safe_to_reopen"] = True
+    return enriched
 
 
 def classify_job_directory(job_dir: Path, codex_home: Path) -> dict[str, Any]:
@@ -3005,7 +3332,7 @@ def classify_job_directory(job_dir: Path, codex_home: Path) -> dict[str, Any]:
         ):
             raise HelperError("The job belongs to a different Codex home.")
         inactive, lock_reason = inactive_job_locks(job_dir)
-        enriched = receipt_with_stable_action(receipt)
+        enriched = receipt_with_runtime_action(job_dir, receipt)
         result.update(
             {
                 "schema_version": receipt.get("schema_version"),
@@ -3040,6 +3367,15 @@ def classify_job_directory(job_dir: Path, codex_home: Path) -> dict[str, Any]:
                     "snapshot was misclassified as unverifiable."
                 ),
             )
+        elif recoverable_skipped_historical_component(enriched):
+            result.update(
+                classification="recoverable_skipped_historical_component",
+                recommended_action="stage_historical_component_recovery",
+                reason=(
+                    "Target deletion and integrity checks verified; the approved "
+                    "historical component alone was skipped before mutation."
+                ),
+            )
         elif enriched.get("outcome") == OUTCOME_PARTIAL_POSSIBLE or enriched.get(
             "mutation_started"
         ) is True:
@@ -3052,7 +3388,27 @@ def classify_job_directory(job_dir: Path, codex_home: Path) -> dict[str, Any]:
             result.update(
                 classification="retryable_pre_mutation",
                 recommended_action="relaunch_same_job",
-                reason="The request is unconsumed and no mutation started.",
+                reason=str(
+                    enriched.get(
+                        "liveness_reason",
+                        "The request is unconsumed and no mutation started.",
+                    )
+                ),
+            )
+        elif (
+            enriched.get("terminal") is not True
+            and enriched.get("next_action") == NEXT_RESTAGE
+            and enriched.get("safe_to_reopen") is True
+        ):
+            result.update(
+                classification="restage_required_pre_mutation",
+                recommended_action="cancel_and_restage_after_approval",
+                reason=str(
+                    enriched.get(
+                        "liveness_reason",
+                        "The inactive pre-mutation job can no longer be relaunched.",
+                    )
+                ),
             )
         elif enriched.get("terminal") is True:
             result.update(
@@ -3142,6 +3498,7 @@ def cleanup_verified_job_chain(
     if not JOB_ID_RE.fullmatch(current_job_id):
         raise HelperError("The successful job directory has an invalid ID.")
     lineage = cleanup_job_ids_from_receipt(receipt)
+    recovery_ids = set(recovery_job_ids_from_receipt(receipt))
     ordered_ids = [*lineage, current_job_id]
     if len(ordered_ids) != len(set(ordered_ids)):
         raise HelperError("The cleanup lineage contains a cycle.")
@@ -3185,8 +3542,15 @@ def cleanup_verified_job_chain(
             if job_id == current_job_id:
                 if not verified_success_receipt(candidate_receipt):
                     raise HelperError("The current success receipt changed before cleanup.")
+            elif job_id in recovery_ids:
+                if not recoverable_skipped_historical_component(candidate_receipt):
+                    raise HelperError(
+                        f"Cleanup recovery predecessor changed or is ineligible: {job_id}"
+                    )
             elif (
                 candidate_receipt.get("terminal") is not True
+                or candidate_receipt.get("mutation_started") is True
+                or candidate_receipt.get("outcome") == OUTCOME_PARTIAL_POSSIBLE
                 or candidate_receipt.get("deletion_success") is True
                 or candidate_receipt.get("permanent_deletion_complete") is True
             ):
@@ -3305,6 +3669,7 @@ def staged_plan_summary(
     plan: Any,
     approval_scope: str,
     execution_snapshot: dict[str, Any] | None = None,
+    historical_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     historical = plan.historical_residuals
     historical_summary = historical.get("summary", {})
@@ -3314,7 +3679,7 @@ def staged_plan_summary(
     component_summary = plan_component_summary(plan, execution_snapshot)
     execution_summary = plan_execution_summary(plan, execution_snapshot)
     desktop_mutation_components = approved_desktop_mutation_components(
-        core, plan, execution_snapshot
+        core, plan, execution_snapshot, historical_snapshot
     )
     desktop_offline_required = bool(desktop_mutation_components)
     return {
@@ -3423,6 +3788,13 @@ def validated_cleanup_lineage(
                 "A retryable non-terminal job must be relaunched instead of superseded."
             )
         if (
+            receipt.get("mutation_started") is True
+            or receipt.get("outcome") == OUTCOME_PARTIAL_POSSIBLE
+        ):
+            raise HelperError(
+                "A partially mutated job requires an explicitly validated recovery path."
+            )
+        if (
             receipt.get("permanent_deletion_complete") is True
             or receipt.get("deletion_success") is True
         ):
@@ -3445,6 +3817,114 @@ def validated_cleanup_lineage(
                 if inherited_dir.exists():
                     pending.append(str(inherited_dir))
     return accepted
+
+
+def validated_historical_recovery_lineage(
+    job_root: Path,
+    recovery_job_dirs: Iterable[str],
+    codex_home: Path,
+    core: types.ModuleType,
+    plan: Any,
+    execution_snapshot: dict[str, Any],
+    historical_snapshot: dict[str, Any],
+    options: dict[str, bool],
+) -> tuple[list[str], list[str]]:
+    """Validate one partial receipt whose only unfinished work is historical."""
+
+    requested = [str(item) for item in recovery_job_dirs if str(item)]
+    if not requested:
+        return [], []
+    if len(requested) != 1:
+        raise HelperError("Exactly one partial historical recovery job is supported.")
+    secure_directory(job_root)
+    raw = Path(requested[0]).expanduser()
+    if not raw.is_absolute():
+        raise HelperError("A recovery job directory must be absolute.")
+    resolved = raw.resolve()
+    if resolved != raw or resolved.parent != job_root:
+        raise HelperError(
+            "A recovery job must be an exact real child of the selected job root."
+        )
+    secure_directory(resolved)
+    if not JOB_ID_RE.fullmatch(resolved.name):
+        raise HelperError("The recovery job directory has an invalid ID.")
+    inactive, reason = inactive_job_locks(resolved)
+    if not inactive:
+        raise HelperError(reason or "The recovery job is still active.")
+    receipt = read_private_json(
+        resolved / RECEIPT_FILENAME,
+        maximum=MAX_RECEIPT_BYTES,
+    )
+    if (
+        receipt.get("schema_version") not in {5, RECEIPT_SCHEMA_VERSION}
+        or receipt.get("protocol_version") not in {5, PROTOCOL_VERSION}
+        or receipt.get("job_id") != resolved.name
+    ):
+        raise HelperError("The recovery job has an unsupported receipt.")
+    if not recoverable_skipped_historical_component(receipt):
+        raise HelperError(
+            "The partial job is not an exact skipped-historical recovery candidate."
+        )
+    metadata = receipt.get("request", {})
+    prior_options = metadata.get("options", {}) if isinstance(metadata, dict) else {}
+    current_ids = sorted(str(item).lower() for item in plan.root_ids)
+    prior_ids = metadata.get("session_ids", []) if isinstance(metadata, dict) else []
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("codex_home") != str(codex_home)
+        or prior_ids != current_ids
+        or prior_options != options
+    ):
+        raise HelperError(
+            "The recovery scope differs from the retained partial job."
+        )
+    fresh_target_absence_evidence(receipt, resolved)
+    detector = getattr(core, "execution_snapshot_target_work_components", None)
+    if not callable(detector) or detector(execution_snapshot):
+        raise HelperError(
+            "The fresh recovery plan contains target work and cannot be historical-only."
+        )
+    nonzero_target_counts = {
+        key: int(plan.counts.get(key, 0) or 0)
+        for key in TARGET_ABSENCE_COUNT_KEYS
+        if int(plan.counts.get(key, 0) or 0) != 0
+    }
+    if nonzero_target_counts:
+        raise HelperError("The fresh recovery plan still contains target-owned objects.")
+    component_plans = getattr(plan, "component_plans", {})
+    if not isinstance(component_plans, dict):
+        raise HelperError("The fresh recovery plan lacks component boundaries.")
+    for component, component_plan in component_plans.items():
+        status = (
+            component_plan.get("status", "enabled")
+            if isinstance(component_plan, dict)
+            else "enabled"
+        )
+        if component == "historical":
+            if status != "enabled":
+                raise HelperError("The historical recovery component is unavailable.")
+        elif status == "enabled":
+            raise HelperError(
+                "The fresh recovery plan enables a non-historical component."
+            )
+    historical_detector = getattr(core, "historical_snapshot_has_approved_work", None)
+    if not callable(historical_detector) or not historical_detector(historical_snapshot):
+        raise HelperError("The fresh approved historical snapshot contains no work.")
+    inherited = metadata.get("cleanup_job_ids", [])
+    if inherited is None:
+        inherited = []
+    if not isinstance(inherited, list) or any(
+        not isinstance(item, str) or not JOB_ID_RE.fullmatch(item)
+        for item in inherited
+    ):
+        raise HelperError("The recovery job contains an invalid inherited lineage.")
+    inherited_dirs = [str(job_root / job_id) for job_id in inherited]
+    inherited_ids = validated_cleanup_lineage(
+        job_root,
+        inherited_dirs,
+        codex_home,
+    )
+    return [resolved.name], inherited_ids
 
 
 def stage_handoff(args: argparse.Namespace) -> int:
@@ -3488,7 +3968,18 @@ def stage_handoff(args: argparse.Namespace) -> int:
         execution_snapshot = selected_approval_payload.get("execution_snapshot", {})
         if not isinstance(execution_snapshot, dict):
             execution_snapshot = {}
-        summary = staged_plan_summary(core, plan, scope, execution_snapshot)
+        historical_snapshot = selected_approval_payload.get(
+            "historical_snapshot", {}
+        )
+        if not isinstance(historical_snapshot, dict):
+            historical_snapshot = {}
+        summary = staged_plan_summary(
+            core,
+            plan,
+            scope,
+            execution_snapshot,
+            historical_snapshot,
+        )
         confirmed_fingerprint = str(args.confirm_plan_fingerprint).lower()
         selected_scope_fingerprint = core.approval_scope_fingerprint(
             plan,
@@ -3526,10 +4017,31 @@ def stage_handoff(args: argparse.Namespace) -> int:
             if args.job_root
             else codex_home / DEFAULT_JOB_ROOT_NAME
         )
-        cleanup_job_ids = validated_cleanup_lineage(
+        superseded_job_ids = validated_cleanup_lineage(
             job_root,
             args.supersedes_job_dir,
             codex_home,
+        )
+        recovery_job_ids, inherited_recovery_job_ids = (
+            validated_historical_recovery_lineage(
+                job_root,
+                getattr(args, "recovers_partial_job_dir", []),
+                codex_home,
+                core,
+                plan,
+                execution_snapshot,
+                historical_snapshot,
+                options,
+            )
+        )
+        cleanup_job_ids = list(
+            dict.fromkeys(
+                [
+                    *recovery_job_ids,
+                    *inherited_recovery_job_ids,
+                    *superseded_job_ids,
+                ]
+            )
         )
         job_id = uuid.uuid4().hex
         request = build_request(
@@ -3593,6 +4105,7 @@ def stage_handoff(args: argparse.Namespace) -> int:
             safety_warnings=summary["safety_warnings"],
             component_summary=summary["component_summary"],
             execution_summary=summary["execution_summary"],
+            recovery_job_ids=recovery_job_ids,
         )
         public_result = {
             "staged": True,
@@ -3618,6 +4131,7 @@ def stage_handoff(args: argparse.Namespace) -> int:
             "safety_warnings": summary["safety_warnings"],
             "component_summary": summary["component_summary"],
             "execution_summary": summary["execution_summary"],
+            "recovery_job_ids": recovery_job_ids,
         }
         print(
             public_json_dumps(
@@ -4128,7 +4642,8 @@ def run_ghostty_worker(job_dir: Path) -> int:
 
     print("Codex 会话删除已在 Ghostty 中准备就绪。", flush=True)
     print(
-        "请现在手动完全退出 ChatGPT/Codex Desktop；本助手不会主动退出或重启它。",
+        "[1/4] 等待退出：请现在手动完全退出 ChatGPT/Codex Desktop；"
+        "本助手不会主动退出或重启它。",
         flush=True,
     )
     print("检测到应用稳定离线后，才会开始删除与完整性验证。", flush=True)
@@ -4152,12 +4667,19 @@ def run_ghostty_worker(job_dir: Path) -> int:
             if receipt.get("safe_to_reopen") is True and receipt.get("phase") == "complete":
                 if receipt.get("outcome") == OUTCOME_NO_SAFE_WORK:
                     print(
-                        "未执行任何安全删除；已确认状态未被修改。你现在可以手动重新打开 Codex。"
+                        "[4/4] 未执行任何安全删除；已确认状态未被修改。"
+                        "你现在可以手动重新打开 Codex。"
                     )
                 elif receipt.get("outcome") == OUTCOME_COMPLETE_WITH_WARNINGS:
-                    print("安全执行和离线验证已完成，但保留了警告项。你现在可以手动重新打开 Codex。")
+                    print(
+                        "[4/4] 安全执行和离线验证已完成，但保留了警告项。"
+                        "你现在可以手动重新打开 Codex。"
+                    )
                 elif receipt.get("outcome") == OUTCOME_COMPLETE:
-                    print("删除和离线验证均已成功。你现在可以手动重新打开 Codex。")
+                    print(
+                        "[4/4] 删除和离线验证均已成功。"
+                        "你现在可以手动重新打开 Codex。"
+                    )
                 else:
                     print("已安全结束且未确认删除成功；请按回执指引继续。")
             elif exit_code == EXIT_PLAN_CHANGED:
@@ -4195,7 +4717,7 @@ def run_ghostty_worker(job_dir: Path) -> int:
 
 
 def compact_receipt_status(job_dir: Path, receipt: dict[str, Any]) -> dict[str, Any]:
-    enriched = receipt_with_stable_action(receipt)
+    enriched = receipt_with_runtime_action(job_dir, receipt)
     request = enriched.get("request", {})
     errors = enriched.get("errors", [])
     warnings = enriched.get("safety_warnings", [])
@@ -4212,6 +4734,8 @@ def compact_receipt_status(job_dir: Path, receipt: dict[str, Any]) -> dict[str, 
         ),
         "verification_ok": bool(enriched.get("verification_ok")),
         "safe_to_reopen": bool(enriched.get("safe_to_reopen")),
+        "worker_active": enriched.get("worker_active"),
+        "liveness_reason": enriched.get("liveness_reason"),
         "cleanup_pending": bool(enriched.get("cleanup_pending")),
         "cleanup_pending_job_ids": list(
             enriched.get("cleanup_pending_job_ids", [])
@@ -4248,7 +4772,7 @@ def read_status(job_dir: Path, *, full: bool = False) -> int:
     secure_directory(job_dir)
     payload = read_private_json(job_dir / RECEIPT_FILENAME, maximum=MAX_RECEIPT_BYTES)
     payload = (
-        receipt_with_stable_action(payload)
+        receipt_with_runtime_action(job_dir, payload)
         if full
         else compact_receipt_status(job_dir, payload)
     )
@@ -4560,6 +5084,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             help=(
                 "Carry one terminal failed job into the bounded cleanup chain; "
                 "repeat for multiple predecessors."
+            ),
+        )
+        command_parser.add_argument(
+            "--recovers-partial-job-dir",
+            action="append",
+            default=[],
+            help=(
+                "Link one strictly verified partial job whose target deletion "
+                "succeeded and whose historical component alone remains."
             ),
         )
 

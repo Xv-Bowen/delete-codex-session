@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import io
 import json
@@ -13,7 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 
 if not __debug__:
@@ -904,6 +905,47 @@ def run_cmd(
     return proc
 
 
+def run_cmd_with_desktop_offline(
+    *args: str,
+    expect: int = 0,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the core in-process with an explicit offline-owner test boundary."""
+
+    module = load_deleter_module()
+    original_argv = sys.argv
+    original_owner_check = module.desktop_owner_processes
+    prior_env = {key: os.environ.get(key) for key in (env or {})}
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        sys.argv = [str(SCRIPT), *args]
+        module.desktop_owner_processes = lambda _codex_home: ([], "")
+        if env:
+            os.environ.update(env)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            returncode = module.main()
+    finally:
+        sys.argv = original_argv
+        module.desktop_owner_processes = original_owner_check
+        for key, value in prior_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    proc = subprocess.CompletedProcess(
+        [sys.executable, str(SCRIPT), *args],
+        returncode,
+        stdout.getvalue(),
+        stderr.getvalue(),
+    )
+    if proc.returncode != expect:
+        raise AssertionError(
+            f"expected {expect}, got {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+    return proc
+
+
 def exercise(
     apply_historical_residuals: bool,
     apply_missing_rollout_threads: bool = False,
@@ -968,7 +1010,7 @@ def exercise(
         plan = payload["plan"]
         fingerprint = plan["plan_fingerprint"]
         assert len(fingerprint) == 64
-        assert plan["plan_contract_version"] == 13
+        assert plan["plan_contract_version"] == 14
         assert plan["approval_contract_version"] == 4
         assert len(plan["target_edge_rows"]) == 3
         assert set(plan["scope_safety"]["target_open_or_unknown_sessions"]) == {
@@ -977,7 +1019,7 @@ def exercise(
         }
         assert scope_token(plan, force_open=True) != fingerprint
         assert plan["blockers"] == []
-        assert plan["script_version"] == "3.4"
+        assert plan["script_version"] == "4.0"
         assert scope_token(plan).startswith("v4.")
         assert plan["preflight"]["state_quick_check"] == "ok"
         assert plan["preflight"]["state_schema_issues"] == []
@@ -1054,9 +1096,6 @@ def exercise(
             apply_args.append("--apply-historical-residuals")
         if apply_missing_rollout_threads:
             apply_args.append("--apply-missing-rollout-threads")
-        applied = run_cmd(*apply_args)
-        applied_payload = json.loads(applied.stdout)
-        assert applied_payload["apply_result"]["success"] is True
         expected_scope = (
             "targets_historical_and_missing_rollout_threads"
             if apply_missing_rollout_threads
@@ -1066,6 +1105,44 @@ def exercise(
                 else "targets_only"
             )
         )
+        if apply_historical_residuals:
+            module = load_deleter_module()
+            module_plan = module.make_plan(
+                codex_home,
+                [TARGET_PARENT],
+                True,
+                True,
+                True,
+            )
+            approval_payload = module.validated_approval_payload(
+                module_plan,
+                approved_token,
+                True,
+                apply_missing_rollout_threads,
+                True,
+            )
+            assert approval_payload is not None
+            original_owner_check = module.desktop_owner_processes
+            module.desktop_owner_processes = lambda _codex_home: ([], "")
+            try:
+                apply_result = module.apply_plan(
+                    module_plan,
+                    approval_payload["historical_snapshot"],
+                    True,
+                    True,
+                    True,
+                    apply_missing_rollout_threads,
+                    expected_scope + "_force_open",
+                    approval_payload["execution_snapshot"],
+                    True,
+                )
+            finally:
+                module.desktop_owner_processes = original_owner_check
+            applied_payload = {"apply_result": apply_result}
+        else:
+            applied = run_cmd(*apply_args)
+            applied_payload = json.loads(applied.stdout)
+        assert applied_payload["apply_result"]["success"] is True
         assert applied_payload["apply_result"]["approval_scope"] == (
             expected_scope + "_force_open"
         )
@@ -1231,7 +1308,7 @@ def exercise_batch_and_id_validation() -> None:
         plan = json.loads(report.stdout)["plan"]
         assert plan["root_ids"] == [TARGET_PARENT, KEEP_SESSION]
         assert plan["target_count"] == 6
-        assert plan["script_version"] == "3.4"
+        assert plan["script_version"] == "4.0"
 
         invalid = run_cmd(
             "aaaaaaaa----aaaaaaaa",
@@ -3113,7 +3190,16 @@ def exercise_ambiguous_artifact_owner_blocker() -> None:
             "--json",
         )
         plan = json.loads(report.stdout)["plan"]
-        assert_safety_warning(plan, "ambiguous ownership")
+        assert not any(
+            "ambiguous ownership" in warning.get("message", "")
+            for warning in plan["safety_warnings"]
+        )
+        assert any(
+            item.get("basis") == "unique_authoritative_state_match"
+            and item.get("owner_session_id") == KEEP_SESSION
+            and item.get("path") == str(ambiguous)
+            for item in plan["artifact_ownership_evidence"]
+        )
         applied = run_cmd(
             OLD_FILE_ONLY,
             "--codex-home",
@@ -3149,7 +3235,16 @@ def exercise_ambiguous_generated_owner_blocker() -> None:
             "--json",
         )
         plan = json.loads(report.stdout)["plan"]
-        assert_safety_warning(plan, "ambiguous ownership")
+        assert not any(
+            "ambiguous ownership" in warning.get("message", "")
+            for warning in plan["safety_warnings"]
+        )
+        assert any(
+            item.get("basis") == "unique_authoritative_state_match"
+            and item.get("owner_session_id") == KEEP_SESSION
+            and item.get("path") == str(ambiguous)
+            for item in plan["artifact_ownership_evidence"]
+        )
         assert str(generated_dir) not in plan["generated_artifacts"]
         applied = run_cmd(
             OLD_FILE_ONLY,
@@ -3165,6 +3260,51 @@ def exercise_ambiguous_generated_owner_blocker() -> None:
             json.loads(applied.stdout)["apply_result"]
         )
         assert ambiguous.read_bytes() == b"keep-owned generated sentinel"
+
+
+def exercise_historical_locked_scan_uses_authoritative_owner() -> None:
+    with temporary_directory() as tmp:
+        codex_home = Path(tmp) / ".codex"
+        codex_home.mkdir()
+        state_path = codex_home / "state_5.sqlite"
+        logs_path = codex_home / "logs_2.sqlite"
+        init_state(state_path, codex_home)
+        init_logs(logs_path)
+        ambiguous = (
+            codex_home
+            / "sessions"
+            / "2026"
+            / "05"
+            / "03"
+            / f"rollout-{OLD_FILE_ONLY}_{KEEP_SESSION}.jsonl"
+        )
+        ambiguous.write_text("live-owner sentinel\n", encoding="utf-8")
+
+        module = load_deleter_module()
+        approved = module.scan_historical_residuals(
+            codex_home,
+            set(),
+            True,
+        )
+        assert approved["scanned"] is True
+        assert all(
+            entry.get("path") != str(ambiguous)
+            for entry in approved["rollout_files_without_state"]
+        )
+        result = module.cleanup_historical_residuals(
+            codex_home,
+            approved,
+            True,
+            set(),
+            False,
+            True,
+            True,
+            state_database_path=state_path,
+            logs_database_path=logs_path,
+        )
+        assert result["applied"] is True
+        assert result["verification"]["cleanup_ok"] is True
+        assert ambiguous.read_text(encoding="utf-8") == "live-owner sentinel\n"
 
 
 def exercise_artifact_content_contract() -> None:
@@ -3507,7 +3647,7 @@ def fake_offline_core(token: str) -> ModuleType:
                     "mode": "apply",
                     "plan": {
                         "script_version": "test",
-                        "plan_contract_version": 13,
+                        "plan_contract_version": 14,
                         "approval_contract_version": 4,
                         "plan_fingerprint": "f" * 64,
                         "root_ids": [TARGET_PARENT],
@@ -3531,6 +3671,73 @@ def read_offline_receipt(job_dir: Path) -> dict[str, object]:
     value = json.loads((job_dir / "receipt.json").read_text(encoding="utf-8"))
     assert isinstance(value, dict)
     return value
+
+
+def exercise_desktop_state_owner_roles() -> None:
+    helper = load_offline_helper_module()
+    bundle = Path("/Applications/ChatGPT.app")
+    assert (
+        helper.desktop_process_role(
+            bundle,
+            bundle / "Contents" / "MacOS" / "ChatGPT",
+            "ChatGPT",
+        )
+        == "main_application"
+    )
+    assert (
+        helper.desktop_process_role(
+            bundle,
+            bundle / "Contents" / "Resources" / "codex",
+            "ChatGPT",
+        )
+        == "session_backend"
+    )
+    for relative in [
+        "Contents/Frameworks/Codex Framework.framework/Helpers/browser_crashpad_handler",
+        "Contents/Frameworks/Codex Framework.framework/Helpers/Codex (Renderer)",
+        "Contents/Resources/cua_node/bin/node",
+        "Contents/Resources/codex-code-mode-host",
+    ]:
+        assert (
+            helper.desktop_process_role(bundle, bundle / relative, "ChatGPT")
+            == "auxiliary"
+        )
+
+
+def exercise_inactive_premutation_worker_is_retryable() -> None:
+    helper = load_offline_helper_module()
+    with temporary_directory() as tmp:
+        root = Path(tmp)
+        job_dir, _token = create_offline_helper_test_job(
+            helper,
+            root,
+            job_id="e" * 32,
+        )
+        helper.ReceiptWriter(job_dir).update(
+            phase="waiting_for_manual_exit",
+            outcome=helper.OUTCOME_WAITING_OFFLINE,
+            next_action=helper.NEXT_QUIT_AND_WAIT,
+            terminal=False,
+            mutation_started=False,
+            request_consumed=False,
+            request_integrity_verified=True,
+            worker_pid=999_999_999,
+        )
+        receipt = read_offline_receipt(job_dir)
+        assessment = helper.inactive_premutation_assessment(job_dir, receipt)
+        assert assessment["eligible"] is True
+        assert assessment["retryable"] is True
+        assert assessment["next_action"] == helper.NEXT_RETRY_LAUNCH
+
+        status = helper.receipt_with_runtime_action(job_dir, receipt)
+        assert status["next_action"] == helper.NEXT_RETRY_LAUNCH
+        assert status["retryable"] is True
+        assert status["safe_to_reopen"] is True
+
+        codex_home = root / ".codex"
+        classified = helper.classify_job_directory(job_dir, codex_home)
+        assert classified["classification"] == "retryable_pre_mutation"
+        assert classified["recommended_action"] == "relaunch_same_job"
 
 
 def run_helper_captured(
@@ -4246,9 +4453,12 @@ def exercise_staged_manual_only_success() -> None:
             _timeout_seconds: float,
             stability_seconds: float,
             _poll_interval_seconds: float,
+            sample_callback: object | None = None,
         ) -> dict[str, object]:
             nonlocal offline_stable
             assert stability_seconds == 0.5
+            assert callable(sample_callback)
+            sample_callback([])
             offline_stable = True
             return {
                 "offline": True,
@@ -5420,7 +5630,7 @@ def exercise_open_missing_rollout_scope() -> None:
             OLD_MISSING_ROLLOUT in plan["scope_safety"]["missing_rollout_open_threads"]
         )
         assert_safety_warning(plan, "Open or unknown-status session")
-        applied = run_cmd(
+        applied = run_cmd_with_desktop_offline(
             TARGET_CLOSED_CHILD,
             "--codex-home",
             str(codex_home),
@@ -6161,7 +6371,7 @@ def exercise_rollout_migration_missing_thread_cleanup() -> None:
             if entry["id"] == OLD_MISSING_ROLLOUT
         )
         assert len(missing_entry["rollout_migration_skipped_rows"]) == 1
-        applied = run_cmd(
+        applied = run_cmd_with_desktop_offline(
             TARGET_CLOSED_CHILD,
             "--codex-home",
             str(codex_home),
@@ -6260,6 +6470,21 @@ def exercise_paginated_history_support_and_guards() -> None:
             conn.execute(
                 "INSERT INTO future_metadata (note) VALUES ('unrelated extension')"
             )
+            conn.execute(
+                "CREATE TABLE thread_realtime_items ("
+                "thread_id TEXT NOT NULL, item_id TEXT NOT NULL, "
+                "PRIMARY KEY (thread_id, item_id))"
+            )
+            conn.executemany(
+                "INSERT INTO thread_realtime_items VALUES (?, ?)",
+                [(KEEP_SESSION, "target-item"), (TARGET_PARENT, "keep-item")],
+            )
+            conn.execute(
+                "CREATE TRIGGER thread_realtime_items_projection_cleanup "
+                "AFTER DELETE ON thread_history_projection_state BEGIN "
+                "DELETE FROM thread_realtime_items WHERE thread_id = OLD.thread_id; "
+                "END"
+            )
         conn.close()
 
         module = load_deleter_module()
@@ -6333,8 +6558,25 @@ def exercise_paginated_history_support_and_guards() -> None:
         compatibility = plan["preflight"][
             "paginated_history_schema_compatibility"
         ]
-        assert compatibility["unknown_tables"] == ["future_metadata"]
-        assert compatibility["target_reference_hits"] == []
+        assert compatibility["unknown_tables"] == [
+            "future_metadata",
+            "thread_realtime_items",
+        ]
+        assert compatibility["target_reference_hits"] == [
+            {
+                "table": "thread_realtime_items",
+                "column": "thread_id",
+                "ids": [KEEP_SESSION],
+            }
+        ]
+        effect = compatibility["mutation_effect_assessment"]
+        assert effect["status"] == "target_only"
+        assert effect["outside_scope_change_count"] == 0
+        assert any(
+            entry["table"] == "thread_realtime_items"
+            and entry["removed"] == 1
+            for entry in effect["effects"]
+        )
 
         result = module.apply_plan(
             module_plan,
@@ -6370,6 +6612,9 @@ def exercise_paginated_history_support_and_guards() -> None:
             assert conn.execute(
                 "SELECT note FROM future_metadata"
             ).fetchall() == [("unrelated extension",)]
+            assert conn.execute(
+                "SELECT thread_id, item_id FROM thread_realtime_items"
+            ).fetchall() == [(TARGET_PARENT, "keep-item")]
         finally:
             conn.close()
 
@@ -6528,6 +6773,115 @@ def exercise_paginated_history_support_and_guards() -> None:
         assert snapshot_managed_bytes(codex_home) == before
 
 
+def exercise_paginated_scan_byte_drift_is_runtime_only() -> None:
+    with temporary_directory() as tmp:
+        codex_home = Path(tmp) / ".codex"
+        codex_home.mkdir()
+        state_path = codex_home / "state_5.sqlite"
+        init_state(state_path, codex_home)
+        init_logs(codex_home / "logs_2.sqlite")
+        history_path = codex_home / "thread_history_1.sqlite"
+        init_paginated_history(history_path, [KEEP_SESSION])
+        history = sqlite3.connect(history_path)
+        with history:
+            history.execute(
+                "CREATE TABLE thread_realtime_items ("
+                "thread_id TEXT NOT NULL, item_id TEXT NOT NULL, "
+                "PRIMARY KEY (thread_id, item_id))"
+            )
+            history.execute(
+                "INSERT INTO thread_realtime_items VALUES (?, ?)",
+                (KEEP_SESSION, "target-item"),
+            )
+            history.execute(
+                "CREATE TRIGGER thread_realtime_items_projection_cleanup "
+                "AFTER DELETE ON thread_history_projection_state BEGIN "
+                "DELETE FROM thread_realtime_items WHERE thread_id = OLD.thread_id; "
+                "END"
+            )
+        history.close()
+        conn = sqlite3.connect(state_path)
+        with conn:
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN history_mode TEXT NOT NULL "
+                "DEFAULT 'legacy'"
+            )
+            conn.execute(
+                "UPDATE threads SET history_mode='paginated' WHERE id=?",
+                (KEEP_SESSION,),
+            )
+        conn.close()
+
+        module = load_deleter_module()
+        module.desktop_owner_processes = lambda _codex_home: ([], "")
+        plan = module.make_plan(
+            codex_home,
+            [KEEP_SESSION],
+            False,
+            True,
+            False,
+        )
+        execution_snapshot = module.approval_execution_snapshot(plan, False)
+
+        changed_scan_counters = 0
+
+        def bump_scan_counters(value: object) -> None:
+            nonlocal changed_scan_counters
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "scanned_bytes" and isinstance(item, int):
+                        value[key] = item + 1
+                        changed_scan_counters += 1
+                    else:
+                        bump_scan_counters(item)
+            elif isinstance(value, list):
+                for item in value:
+                    bump_scan_counters(item)
+
+        object_contracts = execution_snapshot["object_contracts"]
+        bump_scan_counters(object_contracts["paginated_history_contract"])
+        bump_scan_counters(object_contracts["paginated_history_database_plan"])
+        assert changed_scan_counters >= 3
+
+        narrowed, warnings, retained = module.narrow_plan_for_execution(
+            plan,
+            execution_snapshot,
+            False,
+        )
+        assert narrowed.target_ids == [KEEP_SESSION]
+        assert not any(
+            warning.get("code")
+            in {
+                "paginated_target_dependency_changed",
+                "paginated_history_contract_changed",
+            }
+            for warning in warnings
+        )
+        assert not any(
+            item.get("status") == "retained_paginated_dependency_changed"
+            for item in retained
+        )
+
+        result = module.apply_plan(
+            plan,
+            plan.historical_residuals,
+            True,
+            False,
+            False,
+            False,
+            "targets_only",
+            execution_snapshot=execution_snapshot,
+        )
+        assert result["success"] is True
+        assert result["mutation_started"] is True
+        assert result["verification"]["verification_ok"] is True
+        assert result["paginated_history_cleanup"]["rows_removed"] == {
+            "thread_history_projection_state": 1,
+            "thread_items": 2,
+            "thread_turns": 1,
+        }
+
+
 def exercise_historical_target_edge_contract() -> None:
     with temporary_directory() as tmp:
         codex_home = Path(tmp) / ".codex"
@@ -6551,7 +6905,7 @@ def exercise_historical_target_edge_contract() -> None:
             "--json",
         )
         plan = json.loads(report.stdout)["plan"]
-        applied = run_cmd(
+        applied = run_cmd_with_desktop_offline(
             KEEP_SESSION,
             "--codex-home",
             str(codex_home),
@@ -6932,7 +7286,7 @@ def exercise_additive_historical_snapshot_apply() -> None:
         new_snapshot = snapshots / f"{OLD_FILE_ONLY}.after-report.sh"
         new_snapshot.write_text("after-report\n", encoding="utf-8")
 
-        applied = run_cmd(
+        applied = run_cmd_with_desktop_offline(
             TARGET_CLOSED_CHILD,
             "--codex-home",
             str(codex_home),
@@ -7759,6 +8113,82 @@ def exercise_empty_approved_historical_snapshot_is_satisfied() -> None:
         assert result["historical_residuals"]["approved_snapshot_empty"] is True
 
 
+def exercise_empty_historical_snapshot_does_not_mask_no_safe_work() -> None:
+    module = load_deleter_module()
+    helper = load_offline_helper_module()
+    with temporary_directory() as tmp:
+        codex_home = Path(tmp) / ".codex"
+        codex_home.mkdir()
+        init_state(codex_home / "state_5.sqlite", codex_home)
+        init_logs(codex_home / "logs_2.sqlite")
+        init_desktop_ui_metadata(codex_home, TARGET_CLOSED_CHILD)
+        init_auxiliary_thread_databases(
+            codex_home, [TARGET_CLOSED_CHILD, TARGET_GRANDCHILD]
+        )
+        (codex_home / "session_index.jsonl").write_text(
+            json.dumps({"id": TARGET_CLOSED_CHILD}) + "\n", encoding="utf-8"
+        )
+        module.desktop_owner_processes = lambda _codex_home: ([], "")
+        plan = module.make_plan(
+            codex_home=codex_home,
+            root_ids=[TARGET_CLOSED_CHILD],
+            include_subagents=False,
+            include_logs=True,
+            scan_historical=True,
+        )
+        before = snapshot_managed_bytes(codex_home)
+
+        def fail_prewrite(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("injected final prewrite failure")
+
+        module.apply_target_index_and_state = fail_prewrite
+        module.delete_log_rows = fail_prewrite
+        module.remove_paths = fail_prewrite
+        module.apply_target_desktop_catalog = fail_prewrite
+        module.apply_target_auxiliary_databases = fail_prewrite
+        module.apply_target_global_state = fail_prewrite
+        result = module.apply_plan(
+            plan,
+            empty_historical_snapshot(module),
+            include_logs=True,
+            scan_historical=True,
+            apply_historical_residuals=True,
+            apply_missing_rollout_threads=False,
+            approval_scope="targets_and_historical_residuals",
+            execution_snapshot=module.approval_execution_snapshot(plan, False),
+            force_open=False,
+        )
+
+        assert result["approved_historical_snapshot_empty"] is True
+        assert result["outcome"] == "no_safe_work"
+        assert result["success"] is False
+        assert result["mutation_started"] is False
+        assert result["verification"]["verification_ok"] is True
+        assert snapshot_managed_bytes(codex_home) == before
+        requested = [
+            entry
+            for entry in result["component_results"].values()
+            if entry["status"] != "not_requested"
+        ]
+        assert requested
+        assert all(entry["status"] == "skipped_safely" for entry in requested)
+
+        core_result = helper.CoreInvocationResult(
+            exit_code=0,
+            payload={"apply_result": result},
+            stdout_sha256="0" * 64,
+            stderr="",
+            output_valid=True,
+            owner_reappeared=False,
+            owner_monitor_issue="",
+            pre_apply_owner_blocked=False,
+        )
+        helper_status = helper.core_result_status(core_result)
+        assert helper_status["safe_completion"] is False
+        assert helper_status["controlled_no_safe_work"] is True
+        assert helper_status["outcome"] == "no_safe_work"
+
+
 def mark_empty_historical_partial_job(helper: ModuleType, job_dir: Path) -> None:
     receipt = read_offline_receipt(job_dir)
     request = dict(receipt["request"])
@@ -7826,6 +8256,224 @@ def mark_empty_historical_partial_job(helper: ModuleType, job_dir: Path) -> None
             },
         },
     )
+
+
+def mark_skipped_historical_partial_job(helper: ModuleType, job_dir: Path) -> None:
+    receipt = read_offline_receipt(job_dir)
+    request = dict(receipt["request"])
+    options = dict(request["options"])
+    options.update(
+        scan_historical=True,
+        apply_historical_residuals=True,
+        apply_missing_rollout_threads=False,
+    )
+    request["options"] = options
+    verification = {
+        "verification_ok": True,
+        "historical_snapshot_ok": False,
+        "offline_verification_ok": True,
+        "verification_errors": [],
+        "planned_deleted_remaining": {},
+        "expected_preserved_missing": [],
+        "unexpected_remaining": [],
+        "unexpected_non_target_removed": [],
+        "remaining_rollout_files": [],
+        "remaining_shell_snapshots": [],
+        "remaining_generated_artifacts": [],
+        "residual_counts": {
+            key: 0 for key in helper.TARGET_ABSENCE_COUNT_KEYS
+        },
+        "integrity_checks": {
+            "state": "ok",
+            "logs": "ok",
+            "desktop_catalog": "ok",
+            "paginated_history": "ok",
+            "auxiliary_thread_databases": {},
+        },
+    }
+    component_results = {
+        "historical": {
+            "status": "skipped_safely",
+            "mutation_started": False,
+            "reason": "prewrite identity changed",
+        },
+        "state_and_index": {
+            "status": "completed",
+            "mutation_started": True,
+        },
+    }
+    helper.ReceiptWriter(job_dir).update(
+        phase="partial_or_verification_failed",
+        outcome="partial_possible",
+        next_action="inspect_partial",
+        terminal=True,
+        mutation_started=True,
+        request_consumed=True,
+        success=False,
+        deletion_success=False,
+        verification_ok=True,
+        permanent_deletion_complete=False,
+        partial_possible=True,
+        safe_to_reopen=False,
+        retryable=False,
+        request=request,
+        request_integrity_verified=True,
+        plan_revalidated=True,
+        owner_reappeared=False,
+        errors=[],
+        staged_plan={
+            "historical_residuals": {
+                "scanned": True,
+                "total_ids": 2,
+                "total_items": 3,
+                "has_residuals": True,
+            }
+        },
+        component_summary={
+            "failed_component_count": 0,
+            "component_results": component_results,
+        },
+        core={
+            "result": {
+                "apply_result": {
+                    "outcome": "partial_possible",
+                    "mutation_started": True,
+                    "historical_scan_ok": False,
+                    "historical_cleanup": {"applied": False},
+                    "component_results": component_results,
+                    "verification": verification,
+                }
+            }
+        },
+    )
+
+
+def exercise_skipped_historical_component_recovery_contract() -> None:
+    helper = load_offline_helper_module()
+    with temporary_directory() as tmp:
+        root = Path(tmp)
+        codex_home = root / ".codex"
+        codex_home.mkdir(mode=0o700)
+        job_root = root / "jobs"
+        inherited = create_terminal_metadata_job(
+            helper,
+            job_root,
+            codex_home,
+            "a" * 32,
+            cleanup_job_ids=[],
+            success=False,
+        )
+        partial = create_terminal_metadata_job(
+            helper,
+            job_root,
+            codex_home,
+            "b" * 32,
+            cleanup_job_ids=[inherited.name],
+            success=False,
+        )
+        mark_skipped_historical_partial_job(helper, partial)
+        partial_receipt = read_offline_receipt(partial)
+        assert helper.recoverable_skipped_historical_component(partial_receipt)
+        classification = helper.classify_job_directory(partial, codex_home)
+        assert classification["classification"] == (
+            "recoverable_skipped_historical_component"
+        )
+
+        already_mutated = copy.deepcopy(partial_receipt)
+        already_mutated["core"]["result"]["apply_result"]["component_results"][
+            "historical"
+        ]["mutation_started"] = True
+        assert not helper.recoverable_skipped_historical_component(already_mutated)
+        integrity_failed = copy.deepcopy(partial_receipt)
+        integrity_failed["core"]["result"]["apply_result"]["verification"][
+            "integrity_checks"
+        ]["state"] = "corrupt"
+        assert not helper.recoverable_skipped_historical_component(integrity_failed)
+
+        try:
+            helper.validated_cleanup_lineage(job_root, [str(partial)], codex_home)
+        except helper.HelperError:
+            pass
+        else:
+            raise AssertionError("ordinary supersession accepted a partially mutated job")
+
+        plan = SimpleNamespace(
+            root_ids=[TARGET_PARENT],
+            counts={key: 0 for key in helper.TARGET_ABSENCE_COUNT_KEYS},
+            component_plans={
+                "historical": {"status": "enabled"},
+                "state_and_index": {"status": "skipped"},
+            },
+        )
+        core = ModuleType("recovery_contract_core")
+        core.execution_snapshot_target_work_components = lambda _snapshot: set()
+        core.historical_snapshot_has_approved_work = lambda snapshot: bool(
+            snapshot.get("session_index_rows_without_state")
+        )
+        historical_snapshot = {
+            "scanned": True,
+            "session_index_rows_without_state": [{"id": OLD_FILE_ONLY}],
+        }
+        options = dict(partial_receipt["request"]["options"])
+        original_absence_check = helper.fresh_target_absence_evidence
+        helper.fresh_target_absence_evidence = lambda *_args: {
+            "target_evidence_items": 0
+        }
+        try:
+            recovery_ids, inherited_ids = (
+                helper.validated_historical_recovery_lineage(
+                    job_root,
+                    [str(partial)],
+                    codex_home,
+                    core,
+                    plan,
+                    {},
+                    historical_snapshot,
+                    options,
+                )
+            )
+            assert recovery_ids == [partial.name]
+            assert inherited_ids == [inherited.name]
+
+            helper.fresh_target_absence_evidence = lambda *_args: (_ for _ in ()).throw(
+                helper.HelperError("target snapshot drift")
+            )
+            try:
+                helper.validated_historical_recovery_lineage(
+                    job_root,
+                    [str(partial)],
+                    codex_home,
+                    core,
+                    plan,
+                    {},
+                    historical_snapshot,
+                    options,
+                )
+            except helper.HelperError as exc:
+                assert "target snapshot drift" in str(exc)
+            else:
+                raise AssertionError("target snapshot drift was accepted")
+        finally:
+            helper.fresh_target_absence_evidence = original_absence_check
+
+        current = create_terminal_metadata_job(
+            helper,
+            job_root,
+            codex_home,
+            "c" * 32,
+            cleanup_job_ids=[partial.name, inherited.name],
+            success=True,
+        )
+        helper.ReceiptWriter(current).update(recovery_job_ids=[partial.name])
+        cleanup = helper.cleanup_verified_job_chain(
+            current,
+            read_offline_receipt(current),
+        )
+        assert cleanup["cleanup_complete"] is True
+        assert cleanup["cleaned_job_ids"] == [partial.name, inherited.name, current.name]
+        assert not partial.exists()
+        assert not inherited.exists()
+        assert not current.exists()
 
 
 def exercise_job_root_audit_and_empty_history_recovery() -> None:
@@ -8258,6 +8906,8 @@ def main() -> None:
     exercise_stage_rejects_changed_report_before_job_creation()
     exercise_stage_accepts_paginated_sidecar_churn()
     exercise_ghostty_tcc_denial_is_safe_and_retryable()
+    exercise_desktop_state_owner_roles()
+    exercise_inactive_premutation_worker_is_retryable()
     exercise_staged_scope_and_launch_retry_contract()
     exercise_staged_cancel_revokes_capsule()
     exercise_staged_job_cannot_bypass_ghostty_launch_gate()
@@ -8267,7 +8917,9 @@ def main() -> None:
     exercise_staged_historical_additions_do_not_expand_scope()
     exercise_offline_receipt_lifecycle_cleanup()
     exercise_empty_approved_historical_snapshot_is_satisfied()
+    exercise_empty_historical_snapshot_does_not_mask_no_safe_work()
     exercise_job_root_audit_and_empty_history_recovery()
+    exercise_skipped_historical_component_recovery_contract()
     exercise_offline_helper_request_hash_mismatch()
     exercise_offline_helper_source_drift()
     exercise_global_state_pair_second_publish_failure()
@@ -8282,6 +8934,7 @@ def main() -> None:
     exercise_uuid_ancestor_regression()
     exercise_ambiguous_artifact_owner_blocker()
     exercise_ambiguous_generated_owner_blocker()
+    exercise_historical_locked_scan_uses_authoritative_owner()
     exercise_artifact_content_contract()
     exercise_direct_open_root()
     exercise_symlink_blockers()
@@ -8316,6 +8969,7 @@ def main() -> None:
     exercise_rollout_migration_missing_thread_cleanup()
     exercise_rollout_migration_target_path_blocker()
     exercise_paginated_history_support_and_guards()
+    exercise_paginated_scan_byte_drift_is_runtime_only()
     exercise_historical_target_edge_contract()
     exercise_late_artifact_and_index_additions()
     exercise_late_historical_replacement_reporting()

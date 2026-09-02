@@ -82,13 +82,22 @@ Expose runtime assessment under `preflight.state_schema_compatibility`, `preflig
   "scan_limit_bytes": 67108864,
   "scanned_bytes": 0,
   "user_version": 32,
-  "newer_user_version_accepted": true
+  "newer_user_version_accepted": true,
+  "mutation_effect_assessment": {
+    "status": "target_only",
+    "quick_check": "ok",
+    "effects": [],
+    "outside_scope_change_count": 0,
+    "remaining_target_references": [],
+    "triggers": [],
+    "foreign_keys": []
+  }
 }
 ```
 
-Fields that do not apply to a database may be absent. Unknown tables and newer versions are informational when anchors remain compatible. A non-empty `protected_ids` narrows historical cleanup. A target hit or ambiguous target produces component preservation, not authority to delete the unknown row.
+Fields that do not apply to a database may be absent. Unknown tables, target hits, triggers, foreign keys, and newer versions are evidence rather than automatic blockers. `target_only` means the fixed built-in mutation removed the target references without escaping scope. `target_residual`, `outside_scope`, or `indeterminate` preserves the affected dependency. A non-empty historical `protected_ids` still narrows historical cleanup.
 
-The plan also exposes `state_database`, `logs_database`, and `paginated_history_database_plan`, each with the selected `path` and structural `discovery` inventory. The paginated plan includes projection/turn/item counts plus frozen primary-key and row-hash contracts; do not show hashes in the human report. Desktop catalog and auxiliary roles are discovered from safe managed `.db`/`.sqlite` files by table anchors, not required filenames. `auxiliary_thread_database_plans` remains keyed by the discovered filename and records `status: enabled|skipped`, reasons, anchors, compatibility evidence, and the frozen `preserved_contract`. Apply results include `paginated_history_cleanup` and per-database `database_results`; one `skipped_safely` entry may coexist with `completed` siblings and still produce `completed_with_warnings` when verification succeeds.
+The plan also exposes `state_database`, `logs_database`, `paginated_history_database_plan`, `preflight.state_mutation_effect_assessment`, and `artifact_ownership_evidence`. The paginated contract freezes direct target rows plus row-key/content digests for shadow-observed side effects; do not show hashes in the human report. Ownership evidence records the authoritative owner, filename UUID hints, and decision basis. Desktop catalog and auxiliary roles are discovered from safe managed `.db`/`.sqlite` files by table anchors, not required filenames. `auxiliary_thread_database_plans` remains keyed by the discovered filename and records `status: enabled|skipped`, reasons, anchors, compatibility evidence, and the frozen `preserved_contract`. Apply results include `paginated_history_cleanup` and per-database `database_results`; one `skipped_safely` entry may coexist with `completed` siblings and still produce `completed_with_warnings` when verification succeeds.
 
 ## Plan summary
 
@@ -114,11 +123,11 @@ Use scope 2 as this installed skill's default recommendation whenever authoritat
 
 An immediately following `我批准范围N` binds to the corresponding complete response just displayed and counts as the one combined approval when that scope is applicable and the frozen report is unchanged. Do not request the long response again. A scope-less approval is ambiguous when several scopes were offered, and any plan change requires newly rendered complete responses.
 
-Do not enumerate recent log-only transient worker IDs. A stable note may explain that they were excluded from the frozen historical scope. The report contains one internal `approval_scope_fingerprints` entry per applicable scope. Engine 3.4 / approval-scope contract 2 derives it from an explicit semantic allowlist rather than the complete capsule or runtime report. Target-only fingerprints exclude unselected historical totals; all scopes exclude point-in-time owner observations, preflight diagnostics, non-owning mentions, compatible unrelated schema inventory, volatile file metadata, and SQLite sidecars. Selected historical scopes bind exact historical IDs and identities. Never expose these fingerprints to the user.
+Do not enumerate recent log-only transient worker IDs. A stable note may explain that they were excluded from the frozen historical scope. The report contains one internal `approval_scope_fingerprints` entry per applicable scope. Engine 4.0 / approval-scope contract 2 derives it from an explicit semantic allowlist rather than the complete capsule or runtime report. Target-only fingerprints exclude unselected historical totals; all scopes exclude point-in-time owner observations, non-owning mentions, compatible unrelated schema inventory, volatile file metadata, and SQLite sidecars. Selected target identities, authoritative ownership, target-contained effect contracts, and selected historical identities remain bound. Never expose these fingerprints to the user.
 
 For an unchanged approved offline plan, staging has no second approval state: return `launch_ghostty` and launch it under the already-bound combined approval. Use `restage` only when the plan changed and a fresh approval is required.
 
-The private-job audit uses audit contract version 1 and classifies exact immediate job children as `verified_success_cleanup_ready`, `recoverable_empty_historical_snapshot`, `terminal_failure_supersedable`, `retryable_pre_mutation`, `partial_possible_preserved`, `active`, `pending_preserved`, or `unsafe_preserved`. Finder metadata such as `.DS_Store` is ignored. Unrecognized root entries are reported and preserved. A read-only invocation reports these classes but does not itself authorize removal; when the user is already approving deletion or cleanup, include every exact cleanup, recovery, or predecessor-link action in that same combined approval.
+The private-job audit uses audit contract version 1 and classifies exact immediate job children as `verified_success_cleanup_ready`, `recoverable_empty_historical_snapshot`, `recoverable_skipped_historical_component`, `terminal_failure_supersedable`, `retryable_pre_mutation`, `restage_required_pre_mutation`, `partial_possible_preserved`, `active`, `pending_preserved`, or `unsafe_preserved`. Finder metadata such as `.DS_Store` is ignored. Unrecognized root entries are reported and preserved. A read-only invocation reports these classes but does not itself authorize removal; when the user is already approving deletion or cleanup, include every exact cleanup, recovery, or predecessor-link action in that same combined approval.
 
 ## Apply summary
 
@@ -154,14 +163,16 @@ Verification should distinguish:
 
 Expected-preserved objects do not make verification fail. `verification_ok` requires no planned safe deletions remaining, no unexpected residuals or removals, healthy required integrity checks, and successful offline verification when required.
 
-The offline request/receipt protocol uses schema version 6. A verified successful receipt is normally transient: Ghostty prints the result, then the helper strictly removes the current job and its explicit failed-predecessor chain. `status` returns a compact, read-only projection by default; `--full` returns the retained diagnostic receipt. Compact status includes phase, outcome, next action, mutation/verification flags, cleanup state, selected session IDs, diagnostic counts, and the receipt path.
+The offline request/receipt protocol uses schema version 6. A verified successful receipt is normally transient: Ghostty prints the result, then the helper strictly removes the current job, its explicit pre-mutation failed-predecessor chain, and any exact recovery predecessor recorded separately in `recovery_job_ids`. A recovery predecessor is revalidated at cleanup and cannot be smuggled through ordinary `cleanup_job_ids` supersession. `status` returns a compact, read-only projection by default; `--full` returns the retained diagnostic receipt. Compact status includes phase, outcome, next action, mutation/verification flags, cleanup state, selected session IDs, diagnostic counts, and the receipt path.
 
-Core engine 3.4 records `approved_historical_snapshot_empty: true` when an authoritative selected historical snapshot contains zero IDs and zero items. That selected scope is satisfied without historical mutation or a new global historical rescan. Later residual IDs or items are reported as unapproved and preserved, not treated as failure. A retained receipt from the older false-`partial_possible` behavior may be reclassified only as `recoverable_empty_historical_snapshot`; recovery must freshly verify target absence and integrity before strict metadata cleanup.
+Core engine 4.0 records `approved_historical_snapshot_empty: true` when an authoritative selected historical snapshot contains zero IDs and zero items. That selected scope is satisfied without historical mutation or a new global historical rescan. Later residual IDs or items are reported as unapproved and preserved, not treated as failure. A retained receipt from the older false-`partial_possible` behavior may be reclassified only as `recoverable_empty_historical_snapshot`; recovery must freshly verify target absence and integrity before strict metadata cleanup.
+
+`recoverable_skipped_historical_component` is the non-empty component recovery classification. It means target deletion and verification succeeded, the historical component was skipped before its first write, and no component reported failure. A fresh combined approval and semantic fingerprint must cover the current exact historical identities. Staging returns `stage_historical_component_recovery`, requires a historical-only execution plan with zero target counts, and records the exact predecessor in `recovery_job_ids`. Any target/snapshot drift, historical mutation, verification discrepancy, owner reappearance, or integrity failure remains `partial_possible_preserved`.
 
 ## Recovery summary
 
 For `plan_changed`, state that mutation did not start and show the changed semantic scope before requesting fresh approval. Do not call process churn, compatible additive schema, or SQLite sidecar lifecycle a scope change.
 
-For `partial_possible`, keep Desktop offline and list four groups: confirmed removed, confirmed preserved, uncertain, and recovery files. Use `next_action: inspect_partial`; never imply that an automatic retry is safe.
+For `partial_possible`, keep Desktop offline and list four groups: confirmed removed, confirmed preserved, uncertain, and recovery files. Use `next_action: inspect_partial` unless the audit returns the supported skipped-historical classification; only then may a fresh approved historical-only stage use `stage_historical_component_recovery`. Never imply that a generic retry is safe.
 
 For `cleanup_pending`, state clearly that deletion and verification already succeeded and Desktop may reopen. Show the exact retained job path and use `next_action: retry_cleanup`. `cleanup-completed` retries only the strict private-metadata cleanup; it must not repeat deletion. When cleanup succeeds, the receipt path ceases to exist by design and no post-reopen verification is mandatory.

@@ -4,14 +4,15 @@ Read this reference when a report contains a newer database version, unknown sch
 
 ## Decision model
 
-Use four evidence layers:
+Use five evidence layers:
 
 1. **Family and role discovery** — inventory every `state_*.sqlite`, `logs_*.sqlite`, or `thread_history_*.sqlite` candidate, plus safe `.db`/`.sqlite` files under the managed SQLite directory. Select state/log/paginated-history generations and Desktop/auxiliary roles only from structurally unambiguous anchor matches; do not require a preferred product filename.
 2. **Anchor contract** — the exact tables, locator columns, primary keys, integrity checks, canonical references, and mutation behavior the selected component needs.
 3. **Extension inventory** — unknown tables plus newly introduced thread/session/conversation-shaped columns in known tables.
-4. **Candidate protection** — canonical UUIDs found in extension values, including nested JSON/text and uncompressed byte values.
+4. **Ownership evidence** — authoritative state references and structured thread/session columns; names and embedded UUIDs are hints, not verdicts.
+5. **Mutation effect envelope** — when extensions, triggers, or foreign keys touch target storage, run the exact built-in mutation on an in-memory clone and diff every row before and after.
 
-Version numbers and filenames are discovery signals, not deletion authority. Known table/column/primary-key anchors establish a database role and the exact row locator; they do not authorize unknown tables. A newer version or renamed safe database is compatible when the anchor contract still holds. An extension never enters a delete set automatically.
+Version numbers, filenames, trigger names, and SQL wording are discovery signals, not deletion authority. Known anchors establish a database role and exact row locators. A newer or renamed database is compatible when its anchors hold and the shadow envelope is target-contained. Unknown rows may be removed only indirectly by already-present schema behavior reached from the fixed built-in mutation; the model never creates selectors or SQL for them.
 
 Keep schema evidence in three layers:
 
@@ -23,20 +24,22 @@ The stable SQLite identity is the canonical main file's path, device, inode, typ
 
 ## Runtime classifications
 
-- `compatible_extension`: anchor contract holds and the extension contains no candidate UUID. Leave it untouched and continue.
-- `protected_reference`: extension contains a candidate UUID. Add the UUID to the protected set; never delete the unknown row.
-- `affected_component_preserved`: an approved target is protected or extension inspection is incomplete. Preserve that database component and continue independent work.
-- `incompatible_anchor`: a required primary key or column changed, a relevant trigger can alter known thread storage, integrity failed, or canonical identity is ambiguous. Gate or skip only the dependent component.
+- `not_required`: no schema dependency extends the direct built-in mutation.
+- `target_only`: shadow execution is integral, every changed row is target-owned, no new reference is introduced, and every runtime-discovered target reference is gone. Freeze and continue.
+- `target_residual`: execution stays bounded but leaves a target reference in discovered storage. Preserve the affected dependency.
+- `outside_scope`: a row without target ownership changes, a row is introduced, or integrity fails. Preserve the affected dependency.
+- `indeterminate`: the clone, bounded scan, schema action, or integrity check cannot complete. Preserve the affected dependency.
+- `incompatible_anchor`: a required locator, key, canonical identity, or database boundary changed, so the fixed mutation is no longer well-defined.
 
 Apply these classifications per database, not merely per database class. In particular, one preserved history-snapshot or thread-summary database does not block compatible siblings. Report-time compatible databases may still be downgraded individually if their row or schema identity changes before apply.
 
-If one safe file exposes multiple auxiliary roles, or multiple files expose the same Desktop/auxiliary role, classify discovery as ambiguous and preserve it. A database whose known anchor table is renamed into an unknown table cannot be mutated merely by semantic guessing; inspect it as unknown storage, protect candidate UUIDs, and continue independent components.
+If one safe file exposes multiple auxiliary roles, or multiple files expose the same Desktop/auxiliary role, classify discovery as ambiguous and preserve it. A renamed anchor cannot be recovered by semantic guessing because the deterministic executor no longer has an approved locator.
 
 ## Paginated history contract
 
-Recognize paginated history from the structural trio `thread_history_projection_state`, `thread_turns`, and `thread_items`. Require their canonical thread locator, composite primary keys where applicable, healthy integrity, canonical target IDs, no mutation-affecting triggers, and a complete extension-reference scan. Additive columns, indexes, migrations, views, and unrelated tables are compatible when they do not reference an approved target and the anchors remain intact.
+Recognize paginated history from the structural trio `thread_history_projection_state`, `thread_turns`, and `thread_items`. Require their canonical thread locator, composite primary keys where applicable, healthy integrity, canonical target IDs, and a complete bounded inspection. Triggers and foreign keys are allowed when shadow execution proves their effects are target-contained. An unknown target-bearing table is also compatible when the fixed deletion reaches it through that existing schema behavior and leaves no target reference.
 
-Freeze each target-owned row as its table, complete primary key, and full-row hash. A compatible unrelated table, column, index, view, migration row, or sidecar lifecycle may appear after approval and staging can capture it without fresh user authority when it neither adds a target reference nor changes selected rows or anchors. Apply rechecks the selected path, stable main-file identity, fresh schema/extension inventory, and exact row contracts in one prewrite transaction. Rows newly added or changed after staging retain the whole dependent target before any target component mutates; already-absent approved rows are satisfied. Delete only by the approved primary keys. UUIDs nested in `item_json` or other payloads do not confer ownership and are never additional delete selectors.
+Freeze each direct target row by primary key/full-row hash and every shadow-observed side effect by row-key/content digest. Apply recomputes the effect envelope inside the prewrite boundary and requires it to match. Rows newly added or changed after staging retain the dependent target; already-absent approved direct rows are satisfied. UUIDs nested in ordinary payloads are evidence only and never additional selectors.
 
 ## Historical residual rule
 
@@ -51,15 +54,19 @@ If the bounded extension scan is incomplete, place every affected candidate in `
 
 `recent_log_only_ids` is a bounded transient-activity guard for canonical IDs found only in current log rows. Any rollout, index, snapshot, generated artifact, state reference, or canonical state row disables the exception. After the time window expires, a log-only ID is classified as an ordinary historical residual. The transient IDs are not serialized into the frozen plan, so inspection cannot continuously expand its own scope.
 
+## Artifact ownership
+
+For a state thread, its exact `threads.rollout_path` is the primary ownership assertion. Validate that the path stays inside the managed sessions root, is a regular JSONL file, and is not claimed by another live thread. UUIDs in the relative filename are weak hints. Several UUID hints are acceptable when exactly one live authoritative state thread matches; record `artifact_ownership_evidence`. Repeat this same authoritative-owner resolution after the state transaction lock is acquired, rather than falling back to filename-only ambiguity during historical cleanup. Preserve the object when two live threads claim it, ownership is otherwise unresolved, or path safety fails.
+
 ## Agent judgment boundary
 
-Use the structured assessment to explain what changed, decide whether remaining safe work is useful, recognize ordinary additive compatibility, and recommend an applicable user scope. This judgment boundary applies to the active capable model and is not tied to a hard-coded model family or version. Do not:
+Use the structured assessment to explain what changed, decide whether remaining work is useful, recognize evidence-backed target-contained evolution, and recommend scope. This applies to the active capable model and is not tied to a model name or version. Do not:
 
 - compose mutation SQL for unknown tables;
-- remove an ID from the protected set based on naming intuition;
-- interpret a random UUID mention as permission to delete that row;
-- bypass an incompatible anchor or incomplete integrity check.
+- infer ownership from naming intuition when authoritative evidence conflicts;
+- interpret a random UUID mention as a new deletion selector;
+- bypass an incompatible anchor, escaped effect, or incomplete integrity check.
 
 The runtime assessment is designed to absorb ordinary additive migrations without requiring a Skill update. Encrypted, compressed, unreadable, structurally ambiguous, or fundamentally redefined task storage may still require preservation; the agent may explain and isolate it but may not improvise destructive support.
 
-Use model judgment for classification and explanation, regardless of model family or release. Keep mutation mechanics deterministic: the model cannot add selectors, weaken exact identities, waive an incomplete scan, or reclassify a target-bearing unknown object as deletable. This division lets future capable models reason about compatible evolution without turning confidence into deletion authority.
+Keep mutation mechanics deterministic while leaving evidence interpretation to the model: it cannot add selectors, weaken exact identities, or waive an incomplete effect scan. This lets capable models reason about compatible evolution without turning a long prohibition list into the decision-maker.
